@@ -86,7 +86,7 @@ also removes that permission:
 | `config` | none |
 | `core` | none |
 | `application` | `config`, `core` |
-| `messaging` | `config`, `core` |
+| `messaging` | `core` |
 | `providers` | `application`, `config`, `core` |
 | `api` | `application`, `config`, `core` |
 | `cli` | `config`, `core` |
@@ -222,7 +222,11 @@ for local pre-push verification.
 [cli/entrypoints.py](src/free_claude_code/cli/entrypoints.py) starts the FastAPI server with Uvicorn.
 `serve()` migrates legacy env files when needed, loads cached settings, runs a
 supervised server instance, and can restart the server after admin config changes.
-On final shutdown it best-effort kills registered child processes.
+An Admin restart constructs the next instance only when the prior
+`ApplicationRuntime` reports that its complete ownership graph closed. An
+incomplete ASGI shutdown therefore exits the supervisor instead of overlapping
+old and replacement graphs. On final shutdown it best-effort kills registered
+child processes.
 
 [runtime/bootstrap.py](src/free_claude_code/runtime/bootstrap.py) is the single production composition function. The CLI
 supervisor supplies one settings snapshot and its restart callback; bootstrap
@@ -232,10 +236,12 @@ configures logging, constructs the runtime owners and the configured voice
   the consumer-owned ports in [application/ports.py](src/free_claude_code/application/ports.py); Admin operations retain
   their inbound-adapter port in [api/ports.py](src/free_claude_code/api/ports.py).
 
-[api/app.py](src/free_claude_code/api/app.py) registers routers, HTTP correlation middleware, and exception handlers around
-an explicit `ApiServices` value. It does not read global settings or construct
-runtime resources. `app.state.services` is the only runtime state published to
-FastAPI.
+[api/app.py](src/free_claude_code/api/app.py) registers routers and exception
+handlers around an explicit `ApiServices` value, then wraps the application in a
+pure ASGI correlation boundary. The boundary surrounds the complete wire send;
+it does not proxy streaming responses through `BaseHTTPMiddleware`. The API does
+not read global settings or construct runtime resources.
+`app.state.services` is the only runtime state published to FastAPI.
 
 [runtime/application.py](src/free_claude_code/runtime/application.py) owns process startup and shutdown, optional messaging,
 the selected transcriber, the managed CLI session manager, Admin pending state,
@@ -247,22 +253,27 @@ incomplete graph retryable. Teardown stops at a failed dependency gate rather
 than closing resources that still-live upstream work may need, and the ASGI
 adapter reports that incomplete graph as lifespan shutdown failure. Cleanup is
 completion-driven: generic timeouts do not cancel half-closed external resources;
-the process supervisor owns any force-termination deadline.
+the process supervisor owns any force-termination deadline. Optional messaging
+startup remains nonfatal only when every partially constructed messaging owner
+was successfully cleaned; incomplete startup cleanup fails the application
+startup and retains the graph for the next close attempt.
 [runtime/asgi.py](src/free_claude_code/runtime/asgi.py) drives that owner from ASGI lifespan messages and preserves
 the concise startup-failure contract.
 
 [runtime/provider_manager.py](src/free_claude_code/runtime/provider_manager.py) is the only owner that constructs, publishes,
 retires, and closes provider generations. Each request acquires a generation
 lease before routing. Non-streaming responses release it after aggregation;
-streaming responses release it from the response iterator's `finally` path on
-completion, failure, cancellation, or disconnect. A provider-only Admin Apply
-prepares a candidate and commits configuration before publication. New requests
-then use the candidate while old streams finish on the retired generation; its
-last lease closes it exactly once. Final shutdown rejects new acquisition and
-replacement, waits every lease, and awaits the same manager-owned cleanup task
-even if the initiating request or lease release is cancelled. Failed generation
-or unpublished-candidate cleanup remains owned and retryable; the manager does
-not become terminal or clear its model catalog until every owned runtime closes.
+streaming responses bind it to FCC's response owner, which first closes the
+entire body chain and then releases the lease on completion, failure,
+cancellation, disconnect, or a response-start send failure. A provider-only
+Admin Apply prepares a candidate and commits configuration before publication.
+New requests then use the candidate while old streams finish on the retired
+generation; its last lease closes it exactly once. Final shutdown rejects new
+acquisition and replacement, waits every lease, and awaits the same
+manager-owned cleanup task even if the initiating request or lease release is
+cancelled. Failed generation or unpublished-candidate cleanup remains owned and
+retryable; the manager does not become terminal or clear its model catalog until
+every owned runtime closes.
 
 The manager also owns one application-lifetime provider model catalog and its
 single best-effort discovery task. The catalog survives provider replacement.
@@ -345,11 +356,16 @@ proxy auth is disabled. Otherwise the token may be supplied through `x-api-key`,
 `Authorization: Bearer ...`, or `anthropic-auth-token`. Comparisons use
 constant-time matching.
 
-HTTP request correlation is owned at ingress. Middleware creates one opaque FCC
-request ID before routing, places it in log context and request state, and adds
-`request-id` to every response. OpenAI-compatible Responses and the shared model
-catalog also expose the same value as `x-request-id`. Provider execution and
-trace events receive that existing ID; they do not create a second identifier.
+HTTP request correlation is owned at ingress. A pure ASGI boundary creates one
+opaque FCC request ID before routing, places it in log context and request state,
+and adds `request-id` while forwarding the actual `http.response.start` message.
+OpenAI-compatible Responses and the shared model catalog also expose the same
+value as `x-request-id`. Provider execution and trace events receive that
+existing ID; they do not create a second identifier. Keeping the context around
+the complete inner ASGI call preserves correlation during streaming and leaves
+response lifetime finalization under the concrete response owner. Starlette's
+outer server-error boundary bypasses user middleware for its catch-all 500, so
+that one handler explicitly attaches the same ingress-owned headers.
 
 [api/handlers/](src/free_claude_code/api/handlers/) owns the public API product flows.
 `MessagesHandler` validates non-empty messages, resolves models, applies
@@ -365,15 +381,29 @@ it does not depend on FastAPI, provider implementations, or the full settings
 object.
 [api/response_streams.py](src/free_claude_code/api/response_streams.py) owns public streaming egress
 commit timing. It waits for the first protocol chunk before returning a
-successful `StreamingResponse`. A provider-execution failure before that commit
-boundary remains a real typed non-2xx JSON response. Once FCC has finalized the
-failure, the response includes `x-should-retry: false` so FCC retains ownership
-of upstream retry/recovery without causing a second client retry loop. After the
-first chunk has escaped, HTTP status is committed; Messages emits an Anthropic
-`event: error` and closes without a synthetic `message_stop`; Responses emits
-`response.failed` with the original response ID. Non-streaming Messages
-aggregate internally and return non-2xx JSON for any terminal stream error,
-discarding incomplete content rather than presenting a partial success.
+successful FCC-owned `StreamingResponse`. Its explicit replay iterator owns the
+prefetched stream even before replay begins. The response itself owns one
+idempotent finalization task: close the body transitively, then release the
+provider-generation lease. This finalizer surrounds the real ASGI send and runs
+to completion even when sending headers or the first body frame fails. A provider
+execution failure before that commit boundary remains a real typed non-2xx JSON
+response. Once FCC has finalized the failure, the response includes
+`x-should-retry: false` so FCC retains ownership of upstream retry/recovery
+without causing a second client retry loop. After the first chunk has escaped,
+HTTP status is committed; Messages emits an Anthropic `event: error` and closes
+without a synthetic `message_stop`; Responses emits `response.failed` with the
+original response ID. Non-streaming Messages aggregate internally and return
+non-2xx JSON for any terminal stream error, discarding incomplete content rather
+than presenting a partial success.
+
+The public response chain follows a transitive close-ownership rule. A response
+owns its replay iterator; replay owns the active protocol adapter; each protocol
+adapter owns its direct input; tracing owns the executor body; the executor body
+owns the provider iterator; and the provider runner owns its upstream stream.
+Each of these response-chain owners closes its direct input on normal completion,
+failure, cancellation, and early consumer close. Failures from those explicit
+cleanup calls are trace metadata and cannot replace an established wire outcome;
+a generation lease is released only after the body chain has finished closing.
 
 Ingress authentication, request validation, model routing, and deterministic
 preflight failures remain ordinary HTTP errors and do not receive the terminal
@@ -511,15 +541,16 @@ There are two transport families under [providers/transports/](src/free_claude_c
 
 - [providers/transports/openai_chat/](src/free_claude_code/providers/transports/openai_chat/)
   implements `OpenAIChatTransport` for providers with OpenAI-compatible
-  `/chat/completions` APIs. The package owns the thin transport base,
-  per-request stream runner, OpenAI request policy, OpenAI tool-call assembly,
-  and OpenAI-chat recovery event construction.
+  `/chat/completions` APIs. Its `transport.py` co-locates the transport base with
+  the exactly typed private per-request runner and its recovery operations; no
+  cross-module object reaches through an untyped transport backchannel. The
+  package also owns OpenAI request policy and tool-call assembly.
 - [providers/transports/anthropic_messages/](src/free_claude_code/providers/transports/anthropic_messages/)
   implements `AnthropicMessagesTransport` for providers with
   Anthropic-compatible `/messages` APIs. In FCC this transport is intentionally
-  local-only for llama.cpp and Ollama. The package owns the thin transport base,
-  native request policy, native stream runner, HTTP response helpers, and native
-  recovery event construction.
+  local-only for llama.cpp and Ollama. Its `transport.py` likewise owns the
+  transport and exactly typed private stream/recovery lifecycle together. The
+  package also owns native request policy and HTTP response helpers.
 
 Both transport families explicitly implement preflight by constructing the same
 upstream request body they will later stream. `BaseProvider` makes that operation
@@ -767,6 +798,8 @@ keeps product policy independent of provider IDs and transport implementation.
 `fcc-codex` launcher:
 
 - `fcc-codex` strips official OpenAI and Codex credential variables.
+- It strips parent-only Codex thread, shell, permission, and origin context so
+  each launched client owns an independent runtime identity.
 - It creates an ephemeral `fcc` model provider with `wire_api = "responses"` and
   a base URL pointing at the local proxy `/v1` path.
 - After proxy health succeeds, it fetches `/v1/models`, writes a generated Codex
@@ -786,7 +819,15 @@ state. The managed session parser extracts persistent Claude session IDs and
 yields Claude stream-json events to the messaging event parser. Managed Claude
 also owns subprocess stderr diagnostic classification so known benign Claude
 Code notices do not become messaging task errors, while unknown stderr remains
-fatal.
+fatal. Before subprocess stop, the manager marks the session closing so new
+lookups and aliases cannot borrow it; the session also marks itself terminal so
+an already-issued reference cannot launch again. One lifecycle lock linearizes
+that terminal transition with subprocess publication. Aliases plus PID
+registration remain owned until exit is confirmed. Aggregate shutdown attempts
+every distinct mapped or closing session, removes only confirmed successes,
+reports a count-only failure, and leaves failures available for the next cleanup
+attempt. Real-session registration is collision-safe and becomes durable tree
+state only after the manager accepts it.
 
 Codex is supported through `fcc-codex` and Codex extensions. FCC does not keep an
 internal managed-Codex session runner because no user-facing messaging setting
@@ -802,7 +843,10 @@ the messaging bridge is skipped.
 
 `ApplicationRuntime` privately owns the selected platform runtime, the
 `MessagingWorkflow`, configured `Transcriber`, and managed CLI session manager.
-The workflow owns conversation snapshot restoration and final persistence flush.
+The workflow owns conversation snapshot restoration and terminal close: cancel
+work, stop managed CLI sessions, await every processor-owned claim and recovery
+task, then flush persistence. Interactive `/stop` keeps its bounded task-drain
+behavior; only terminal close waits for full completion.
 The API sees only the application-owned `TaskController` used to preserve
 `/stop` behavior.
 
@@ -875,7 +919,9 @@ the same transition instead of taking a later mutable-node read. Once a stop or
 clear transition commits, its persistence effects are applied before the later
 interruptible global CLI cleanup. At startup it restores and normalizes
 persisted state before ingress begins, then repairs interrupted platform
-statuses after outbound delivery starts.
+statuses after outbound delivery starts. Diagnostic detail policy is captured
+at construction and passed into the processor; messaging does not read global
+settings while executing callbacks or failures.
 
 [messaging/turn_intake.py](src/free_claude_code/messaging/turn_intake.py) owns inbound message
 recording, slash command dispatch, status-echo filtering, initial status
@@ -950,11 +996,18 @@ before task creation, which is safe under Python's eager task factory, then
 launches claims returned by the aggregate, cancels the exact matching task,
 drains cleanup outside tree locks, and feeds matching completion back to the
 aggregate. Cancellation before a task body starts has an explicit recovery path;
-the cancellation flag is rechecked after callbacks, and callback failure cannot
-prevent successor launch. If a node processor unexpectedly escapes, the
-processor routes failure through the manager-owned aggregate transition; the
-workflow persists its snapshot and schedules its UI effect as normal queue
-advancement continues. [messaging/trees/node.py](src/free_claude_code/messaging/trees/node.py) owns
+the cancellation flag is rechecked after callbacks, and best-effort UI callback
+failure cannot prevent successor launch. If a node processor unexpectedly
+escapes, the processor routes failure through the manager-owned aggregate
+transition; the workflow persists its snapshot and schedules its UI effect as
+normal queue advancement continues. The processor's completion event covers the
+published slot from launch through normal completion, successor publication,
+and pre-run recovery, so terminal workflow close cannot release delivery while
+cleanup is still active. A failed aggregate-completion callback releases its
+finished task slot, records the failure, and hands it to the terminal waiter
+exactly once; a failed close therefore retains the workflow for reconciliation
+instead of hanging on ownership that no longer exists.
+[messaging/trees/node.py](src/free_claude_code/messaging/trees/node.py) owns
 `MessageNode` and `MessageState`; each node keeps only the copied scope and
 prompt needed by the aggregate rather than retaining a mutable ingress value,
 [messaging/trees/graph.py](src/free_claude_code/messaging/trees/graph.py) owns parent/child and
@@ -976,9 +1029,15 @@ shares mutable persisted state. Debounced atomic writes live in
 [messaging/session/persistence.py](src/free_claude_code/messaging/session/persistence.py). One writer
 lock serializes physical replaces, and a generation check under that lock
 prevents an older timer snapshot from landing after a newer flush or clear.
+Timer-triggered saves are best effort and leave the store dirty on failure;
+explicit flushes and authoritative writes propagate failure while preserving
+that dirty state for retry. Successful retry writes the current in-memory
+snapshot and is the only operation that marks it clean.
 Global `/clear` performs an early authoritative wipe, detaches and drains every
 tree, then writes an authoritative empty conversation snapshot while preserving
-message IDs recorded after the early wipe.
+message IDs recorded after the early wipe. Once clear commits, ordinary failures
+from final persistence, cancellation effects, and CLI cleanup are all attempted
+and preserved rather than producing a false successful clear.
 Per-chat message ID tracking for `/clear` lives in
 [messaging/session/message_log.py](src/free_claude_code/messaging/session/message_log.py). `/clear`
 guarantees FCC state cleanup and tries tracked platform deletes through the
@@ -1047,8 +1106,10 @@ adapters, import boundaries, provider catalog contracts, and other invariants.
 The import-boundary contract derives every static production edge with one AST
 scanner and checks the package matrix, exact exceptions, facade ownership, and
 lazy optional imports. The resulting first-party module graph must remain
-acyclic. These tests protect current architectural properties rather than
-preserving deleted modules or an exact internal file layout.
+acyclic. The same contract rejects untyped transport collaborators and private
+transport access from helper modules. These tests protect current architectural
+properties rather than preserving deleted modules or an exact internal file
+layout.
 
 Live and local product tests live under [smoke/](smoke/). See
 [smoke/README.md](smoke/README.md) for target taxonomy, environment variables,

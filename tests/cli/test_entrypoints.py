@@ -277,9 +277,13 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
     servers: list[object] = []
     restart_callbacks: list[Callable[[], None]] = []
 
+    apps: list[SimpleNamespace] = []
+
     def build_asgi_app(_settings: Settings, restart_callback: Callable[[], None]):
         restart_callbacks.append(restart_callback)
-        return MagicMock()
+        app = SimpleNamespace(runtime=SimpleNamespace(is_closed=False))
+        apps.append(app)
+        return app
 
     class FakeServer:
         def __init__(self, config):
@@ -291,6 +295,7 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
             if len(servers) == 1:
                 restart_callbacks[-1]()
                 assert self.should_exit is True
+                self.config.app.runtime.is_closed = True
 
     def fake_config(app, **kwargs):
         return SimpleNamespace(app=app, kwargs=kwargs)
@@ -307,6 +312,47 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
 
     assert len(servers) == 2
     get_settings.cache_clear.assert_called_once()
+    kill_all.assert_called_once()
+
+
+def test_serve_supervisor_refuses_restart_after_incomplete_shutdown() -> None:
+    from free_claude_code.cli import entrypoints
+
+    settings = _launcher_settings()
+    get_settings = MagicMock(return_value=settings)
+    get_settings.cache_clear = MagicMock()
+    servers: list[object] = []
+    restart_callbacks: list[Callable[[], None]] = []
+
+    def build_asgi_app(_settings: Settings, restart_callback: Callable[[], None]):
+        restart_callbacks.append(restart_callback)
+        return SimpleNamespace(runtime=SimpleNamespace(is_closed=False))
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+            servers.append(self)
+
+        def run(self):
+            restart_callbacks[-1]()
+            assert self.should_exit is True
+
+    def fake_config(app, **kwargs):
+        return SimpleNamespace(app=app, kwargs=kwargs)
+
+    with (
+        patch.object(entrypoints, "get_settings", get_settings),
+        patch.object(entrypoints.uvicorn, "Config", side_effect=fake_config),
+        patch.object(entrypoints.uvicorn, "Server", side_effect=FakeServer),
+        patch.object(entrypoints, "build_asgi_app", side_effect=build_asgi_app),
+        patch.object(entrypoints, "_schedule_open_admin_browser"),
+        patch.object(entrypoints, "kill_all_best_effort") as kill_all,
+    ):
+        entrypoints.serve()
+
+    assert len(servers) == 1
+    get_settings.cache_clear.assert_not_called()
     kill_all.assert_called_once()
 
 
@@ -493,6 +539,10 @@ def test_launch_codex_passes_responses_config_and_child_env(
     monkeypatch.setenv("OPENAI_API_KEY", "official-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setenv("CODEX_HOME", "keep-home")
+    monkeypatch.setenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "Codex Desktop")
+    monkeypatch.setenv("CODEX_PERMISSION_PROFILE", "danger-full-access")
+    monkeypatch.setenv("CODEX_SHELL", "1")
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-thread")
     settings = _launcher_settings(port=9191, token="proxy-token")
     catalog_path = tmp_path / "codex-model-catalog.json"
     requests: list[Request] = []
@@ -565,6 +615,10 @@ def test_launch_codex_passes_responses_config_and_child_env(
     child_env = popen.call_args.kwargs["env"]
     assert child_env["FCC_CODEX_API_KEY"] == "proxy-token"
     assert child_env["CODEX_HOME"] == "keep-home"
+    assert "CODEX_INTERNAL_ORIGINATOR_OVERRIDE" not in child_env
+    assert "CODEX_PERMISSION_PROFILE" not in child_env
+    assert "CODEX_SHELL" not in child_env
+    assert "CODEX_THREAD_ID" not in child_env
     assert "OPENAI_API_KEY" not in child_env
     assert "OPENAI_BASE_URL" not in child_env
     register_pid.assert_called_once_with(12345)
