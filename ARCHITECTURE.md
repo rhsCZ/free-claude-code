@@ -938,10 +938,15 @@ cancel and join every older voice handoff; they then cancel any tree that won
 admission during the join. Reply-scoped commands first join the matching voice
 claim and then resolve its authoritative tree, so either the voice cancellation
 or the admitted-tree transition wins and the same scoped request is never
-double-counted. Epoch validation, tree admission, processor publication, and
-persistence of the detached snapshot complete as one workflow-owned operation;
-caller cancellation is restored only after that transaction finishes. Stop and
-clear use the same completion-driven boundary, so caller cancellation cannot
+double-counted. Stop operations return one typed outcome after assigning every
+terminal status owner. The outcome records which message scopes own terminal
+status feedback. Existing task statuses are the sole success UI; the command
+adapter sends a message only for a no-op, work visible only in another scope, or
+the rare voice cancellation that wins before a status ID is bound. Epoch
+validation, tree admission, processor publication, and persistence of the
+detached snapshot complete as one workflow-owned operation; caller cancellation
+is restored only after that transaction finishes. Stop and clear use the same
+completion-driven boundary, so caller cancellation cannot
 leave a committed state transition without its remaining persistence or CLI
 cleanup. At startup it restores and normalizes
 persisted state before ingress begins, then repairs interrupted platform
