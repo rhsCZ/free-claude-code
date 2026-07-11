@@ -6,14 +6,13 @@ from urllib.parse import quote
 
 import httpx
 
+from free_claude_code.application.errors import ApplicationUnavailableError
+from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.providers.base import ProviderConfig
 from free_claude_code.providers.defaults import CLOUDFLARE_AI_REST_ROOT
-from free_claude_code.providers.exceptions import (
-    AuthenticationError,
-    ModelListResponseError,
-)
 from free_claude_code.providers.model_listing import (
-    ProviderModelInfo,
+    ModelListResponseError,
     extract_openai_model_ids,
     model_infos_from_ids,
 )
@@ -49,7 +48,7 @@ def _cloudflare_account_api_url(api_root: str | None, account_id: str) -> str:
 
     stripped_account = account_id.strip()
     if not stripped_account:
-        raise AuthenticationError(
+        raise ApplicationUnavailableError(
             "CLOUDFLARE_ACCOUNT_ID is not set. Add it to your .env file."
         )
     root = (api_root or CLOUDFLARE_AI_REST_ROOT).rstrip("/")
@@ -119,7 +118,7 @@ class CloudflareProvider(OpenAIChatTransport):
             await maybe_await_aclose(response)
 
     def _build_request_body(
-        self, request: Any, thinking_enabled: bool | None = None
+        self, request: MessagesRequest, thinking_enabled: bool | None = None
     ) -> dict:
         return build_openai_chat_request_body(
             request,
@@ -143,7 +142,7 @@ class CloudflareProvider(OpenAIChatTransport):
 
 
 def _apply_cloudflare_request_quirks(
-    body: dict[str, Any], _request: Any, thinking_enabled: bool
+    body: dict[str, Any], _request: MessagesRequest, thinking_enabled: bool
 ) -> None:
     """Attach Cloudflare Workers AI chat-template thinking control."""
     extra_body = body.setdefault("extra_body", {})

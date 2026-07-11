@@ -2,13 +2,13 @@
 
 from collections.abc import Callable
 
+from free_claude_code.application.errors import UnknownProviderError
 from free_claude_code.config.provider_catalog import (
     PROVIDER_CATALOG,
     SUPPORTED_PROVIDER_IDS,
 )
 from free_claude_code.config.settings import Settings
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
-from free_claude_code.providers.exceptions import UnknownProviderTypeError
 from free_claude_code.providers.rate_limit import ProviderRateLimiter
 
 from .config import build_provider_config
@@ -311,10 +311,7 @@ def create_provider(provider_id: str, settings: Settings) -> BaseProvider:
     """Create a provider instance for a supported provider id."""
     descriptor = PROVIDER_CATALOG.get(provider_id)
     if descriptor is None:
-        supported = "', '".join(PROVIDER_CATALOG)
-        raise UnknownProviderTypeError(
-            f"Unknown provider_type: '{provider_id}'. Supported: '{supported}'"
-        )
+        raise UnknownProviderError.for_provider(provider_id, PROVIDER_CATALOG)
 
     factory = PROVIDER_FACTORIES.get(provider_id)
     if factory is None:

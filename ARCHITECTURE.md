@@ -33,8 +33,8 @@ flowchart LR
     Messaging --> ClientCLI[Managed Client CLI Sessions]
     ClientCLI --> ProxyAPI
     ProxyAPI --> Handlers[API Product Handlers]
-    Handlers --> Router[ModelRouter]
-    Handlers --> Executor[ProviderExecutionService]
+    Handlers --> Router[application ModelRouter]
+    Handlers --> Executor[application ProviderExecutor]
     Executor --> Lease[Provider Generation Lease]
     Lease --> Providers[ProviderRuntime]
     Providers --> OpenAIChat[OpenAI Chat Providers]
@@ -45,22 +45,30 @@ flowchart LR
 
 The installable wheel packages are declared in [pyproject.toml](pyproject.toml):
 
+- [src/free_claude_code/application/](src/free_claude_code/application/) is the dependency-leaf application boundary. It
+  owns immutable routing/model-metadata values, model routing, shared provider
+  execution, the consumer-facing `ProviderPort`, request-runtime lease ports,
+  task control, and deterministic request/readiness errors. It depends only on
+  configuration and core protocol-neutral logic.
 - [src/free_claude_code/api/](src/free_claude_code/api/) is the HTTP adapter. It owns the FastAPI app, routes, API product
-  handlers, protocol serialization, local optimizations, and narrow
-  consumer-owned runtime ports.
+  handlers, local optimizations, model-catalog responses, HTTP error mapping,
+  response commit timing, and Admin-specific ports. It consumes application and
+  protocol types instead of defining use cases or wire schemas.
 - [src/free_claude_code/cli/](src/free_claude_code/cli/) owns console entrypoints, client CLI launchers, process/session
   management, and client adapter contracts.
 - [src/free_claude_code/config/](src/free_claude_code/config/) owns settings, provider metadata, filesystem paths,
   logging setup, constants, and provider ID catalogs.
-- [src/free_claude_code/core/](src/free_claude_code/core/) owns provider-neutral protocol logic: Anthropic conversion,
-  SSE construction, OpenAI Responses conversion, stream recovery, token counting,
-  and structured trace helpers.
+- [src/free_claude_code/core/](src/free_claude_code/core/) owns provider-neutral protocol logic: wire request and response
+  models, Anthropic conversion, SSE construction, OpenAI Responses conversion,
+  canonical execution-failure semantics, credential-safe diagnostics, token
+  counting, and structured trace helpers. It never classifies provider SDK or
+  HTTP client exceptions.
 - [src/free_claude_code/messaging/](src/free_claude_code/messaging/) owns optional platform adapters, incoming message
   handling, tree queues, transcript rendering, persistence, commands, and voice
   support.
 - [src/free_claude_code/providers/](src/free_claude_code/providers/) owns provider construction, shared provider base
-  classes, upstream transports, rate limiting, model listing, and concrete
-  provider adapters.
+  classes, upstream transports, SDK/HTTP failure classification, retry and
+  recovery policy, rate limiting, model listing, and concrete provider adapters.
 - [src/free_claude_code/runtime/](src/free_claude_code/runtime/) is the process composition root. It owns application
   startup and shutdown, provider generations, Admin runtime operations, and the
   concrete wiring between API, providers, messaging, and managed CLI sessions.
@@ -69,9 +77,18 @@ The installable wheel packages are declared in [pyproject.toml](pyproject.toml):
 [smoke/](smoke/) contains local and live product smoke tests that can launch
 subprocesses or touch real services.
 
-The main ownership rule is that shared Anthropic and Responses protocol behavior
-belongs in [src/free_claude_code/core/](src/free_claude_code/core/). Provider modules should use neutral helpers rather
-than importing behavior from another provider-specific module.
+The main ownership rule is that Anthropic and Responses protocol schemas and
+shared protocol behavior belong in [src/free_claude_code/core/](src/free_claude_code/core/), while request routing and
+provider execution belong in [src/free_claude_code/application/](src/free_claude_code/application/). Routes use core schemas
+directly for wire validation and call application use cases. Provider modules use
+the same concrete request types and neutral helpers instead of importing the API
+adapter or another provider.
+Protocol consumers use the public `core.anthropic` and
+`core.openai_responses` facades. Low-level core and provider modules may import
+the dependency-leaf `models.py` modules directly so their type dependency is
+explicit; package initialization and those leaves must remain import-order safe.
+The model-list schema stays beside its API-owned construction policy in
+`api/model_catalog.py`; there is no generic API model package.
 
 ## Customer-Facing Contract
 
@@ -114,7 +131,7 @@ new places to add unrelated behavior:
 - [api/handlers/](src/free_claude_code/api/handlers/) owns customer-facing API product flows:
   Claude Messages, OpenAI Responses, and token counting. Keep route handlers
   thin, keep Claude-only behavior in the Messages handler, and use
-  [api/provider_execution.py](src/free_claude_code/api/provider_execution.py) only for shared
+  [application/execution.py](src/free_claude_code/application/execution.py) only for shared
   provider resolution, preflight, tracing, token counting, and streaming.
 - [providers/transports/](src/free_claude_code/providers/transports/) owns provider transport
   families. The OpenAI-chat and native Anthropic transport packages split thin
@@ -154,8 +171,10 @@ On final shutdown it best-effort kills registered child processes.
 [runtime/bootstrap.py](src/free_claude_code/runtime/bootstrap.py) is the single production composition function. The CLI
 supervisor supplies one settings snapshot and its restart callback; bootstrap
 configures logging, constructs the runtime owners and the configured voice
-transcriber, supplies
-[api/ports.py](src/free_claude_code/api/ports.py) to the pure API factory, and returns the ASGI application.
+  transcriber, constructs the explicit `ApiServices` composition value, and
+  returns the ASGI application. Provider request leases and task control satisfy
+  the consumer-owned ports in [application/ports.py](src/free_claude_code/application/ports.py); Admin operations retain
+  their inbound-adapter port in [api/ports.py](src/free_claude_code/api/ports.py).
 
 [api/app.py](src/free_claude_code/api/app.py) registers routers, HTTP correlation middleware, and exception handlers around
 an explicit `ApiServices` value. It does not read global settings or construct
@@ -282,9 +301,12 @@ Claude-only safety-classifier and local optimization policy, handles local web
 server tools, then streams Anthropic SSE. `ResponsesHandler` owns streaming-only
 OpenAI Responses validation and conversion for Codex clients. `TokenCountHandler`
 owns Anthropic token counting. Shared provider execution lives in
-[api/provider_execution.py](src/free_claude_code/api/provider_execution.py), which resolves a
-provider, preflights the upstream request, emits trace events, counts input
-tokens, and returns an Anthropic SSE iterator.
+[application/execution.py](src/free_claude_code/application/execution.py). `ProviderExecutor` resolves the narrow
+consumer-owned `ProviderPort`, synchronously preflights the upstream request,
+emits trace events, counts input tokens, and returns an Anthropic SSE iterator.
+It receives only a provider resolver and the few scalar collaborators it needs;
+it does not depend on FastAPI, provider implementations, or the full settings
+object.
 [api/response_streams.py](src/free_claude_code/api/response_streams.py) owns public streaming egress
 commit timing. It waits for the first protocol chunk before returning a
 successful `StreamingResponse`. A provider-execution failure before that commit
@@ -299,7 +321,10 @@ discarding incomplete content rather than presenting a partial success.
 
 Ingress authentication, request validation, model routing, and deterministic
 preflight failures remain ordinary HTTP errors and do not receive the terminal
-provider-execution retry header.
+provider-execution retry header. Missing provider configuration and a shutting
+down request runtime are application-readiness errors: Messages serializes them
+as Anthropic JSON, Responses serializes them as OpenAI JSON, and neither is
+misclassified as an already-finalized provider execution failure.
 
 ```mermaid
 sequenceDiagram
@@ -307,7 +332,7 @@ sequenceDiagram
     participant Route as FastAPIRoute
     participant Handler as ProductHandler
     participant Router as ModelRouter
-    participant Exec as ProviderExecution
+    participant Exec as ProviderExecutor
     participant Manager as ProviderRuntimeManager
     participant Lease as ProviderGenerationLease
     participant Runtime as ProviderRuntimeGeneration
@@ -339,7 +364,7 @@ provider execution, then converts Anthropic SSE back to Responses SSE.
 
 ## Model Routing
 
-[api/model_router.py](src/free_claude_code/api/model_router.py) resolves incoming client model names.
+[application/routing.py](src/free_claude_code/application/routing.py) resolves incoming client model names.
 It supports two forms:
 
 - Direct provider model refs such as `nvidia_nim/nvidia/model-name`.
@@ -351,7 +376,9 @@ otherwise they fall back to `MODEL`.
 
 The router also resolves thinking. Gateway model IDs can force thinking on or
 off; otherwise `ModelRouter` applies tier-specific thinking overrides or the
-global setting.
+global setting. `ResolvedModel` carries the selected provider's immutable
+`ProviderCapabilities`, so product policy reads explicit semantic capabilities
+instead of inferring behavior from a provider ID or transport family.
 
 `GET /v1/models` advertises:
 
@@ -361,7 +388,9 @@ global setting.
 - built-in Claude model IDs for compatibility with Claude clients.
 
 Provider model discovery and optional thinking metadata live in the
-application-level catalog owned by `ProviderRuntimeManager`. The catalog is not
+application-level catalog owned by `ProviderRuntimeManager`.
+`ProviderModelInfo.supports_thinking` alone owns discovered per-model thinking
+support; provider-wide capabilities do not model thinking. The catalog is not
 part of an individual provider generation, so a hot replacement does not erase
 the last useful model list. Discovery failures retain prior entries.
 
@@ -375,15 +404,21 @@ passes it as `model_catalog_json`. Codex users open the native picker with
 
 Provider metadata is neutral and centralized in
 [config/provider_catalog.py](src/free_claude_code/config/provider_catalog.py). Each
-`ProviderDescriptor` declares provider ID, transport type, capabilities,
+`ProviderDescriptor` declares provider ID, immutable semantic capabilities,
 credential env var, default base URL, settings attribute names, and proxy support.
+Capabilities describe product behavior such as locality and Anthropic server-tool
+passthrough; they do not select a concrete adapter.
 
 [providers/runtime/](src/free_claude_code/providers/runtime/) owns construction details for one
 closable provider generation: factory wiring, provider configuration, lazy
-provider instances, provider-owned rate limiters, and transport cleanup. Each
-lazy provider receives a fresh `ProviderRateLimiter`; there is no process
-singleton or second limiter registry. The provider cache already guarantees one
-provider and limiter per provider ID within a generation. Retired generations
+provider instances, provider-owned rate limiters, and transport cleanup. The
+explicit factory table in
+[providers/runtime/factory.py](src/free_claude_code/providers/runtime/factory.py)
+owns provider-ID-to-constructor selection; concrete provider classes own their
+transport inheritance or composition. Each lazy provider receives a fresh
+`ProviderRateLimiter`; there is no process singleton or second limiter registry.
+The provider cache already guarantees one provider and limiter per provider ID
+within a generation. Retired generations
 retain their own synchronization state until request leases drain, while new
 generations and separate server instances never reuse it. Hot replacement
 therefore begins with fresh quota state; an old and new generation enforce
@@ -393,12 +428,23 @@ configured-model validation belong to `ProviderRuntimeManager` in the runtime
 package. This separates a single generation's resources from process-lifetime
 state.
 
-[providers/base.py](src/free_claude_code/providers/base.py) defines:
+[application/model_metadata.py](src/free_claude_code/application/model_metadata.py) owns the immutable
+`ProviderModelInfo` value consumed by the application catalog. Provider-specific
+model-list modules retain response parsing and construct that value directly;
+there is no provider-layer alias for the former owner.
+
+[application/ports.py](src/free_claude_code/application/ports.py) defines the two provider operations consumed by request
+execution: synchronous `preflight_stream()` and lazy `stream_response()`. API
+handlers and application execution depend on that structural port, never on a
+provider base class. Provider adapters implement it without registration or a
+compatibility layer.
+
+[providers/base.py](src/free_claude_code/providers/base.py) defines provider-internal construction and lifecycle contracts:
 
 - `ProviderConfig`: shared provider settings such as API key, base URL, rate
   limits, timeouts, proxy, thinking, and logging flags.
-- `BaseProvider`: the provider interface for cleanup, model listing, preflight,
-  and `stream_response()`.
+- `BaseProvider`: the abstract implementation base for cleanup, model listing,
+  explicit preflight, and `stream_response()`.
 
 There are two transport families under [providers/transports/](src/free_claude_code/providers/transports/):
 
@@ -413,6 +459,12 @@ There are two transport families under [providers/transports/](src/free_claude_c
   local-only for llama.cpp and Ollama. The package owns the thin transport base,
   native request policy, native stream runner, HTTP response helpers, and native
   recovery event construction.
+
+Both transport families explicitly implement preflight by constructing the same
+upstream request body they will later stream. `BaseProvider` makes that operation
+abstract, so a new provider cannot silently omit the commit-boundary validation.
+LM Studio composes the OpenAI-chat conversion first and its context-budget probe
+second; conversion failure therefore cannot open a stream or run the probe.
 
 Provider request construction mirrors the transport family split. OpenAI-chat
 providers call the OpenAI request policy for Anthropic-to-OpenAI conversion,
@@ -442,8 +494,14 @@ downgrade: if an upstream NIM deployment rejects explicit budget control, FCC
 retries without the budget while preserving thinking enablement.
 
 Shared provider responsibilities include upstream rate limiting, model listing,
-safe error mapping, transport cleanup, thinking/tool handling, retry or recovery
-where supported, and returning Anthropic SSE strings to the service layer.
+SDK/HTTP failure classification, safe diagnostic construction, transport
+cleanup, thinking/tool handling, retry or recovery where supported, and
+returning successful Anthropic SSE strings to the service layer. Final failures
+cross that boundary as `ExecutionFailure`, not as provider-authored wire events.
+Every provider and both transport families receive the same concrete
+`MessagesRequest` owned by the Anthropic protocol package. Known wire fields are
+accessed through that model; `Any` and dynamic attribute lookup are reserved for
+SDK response objects and genuinely open-ended nested extension payloads.
 Provider-specific inputs that do not apply to other upstreams, such as
 Cloudflare's account ID, stay in that provider's factory/client instead of being
 added to shared `ProviderConfig`.
@@ -482,42 +540,68 @@ usage quirks such as DeepSeek prompt-cache counters.
 
 [src/free_claude_code/core/anthropic/](src/free_claude_code/core/anthropic/) owns Anthropic-side protocol behavior:
 
+- `models.py` defines the permissive Messages and token-count wire requests,
+  content/tool/thinking blocks, and Anthropic response envelopes;
+- trace-safe request snapshots stay beside those models so the generic trace
+  module remains protocol-independent and import-order safe;
 - content and message conversion for OpenAI-compatible upstreams;
 - request serialization primitives shared by provider request policies;
 - tool schema and tool-result handling;
 - thinking block handling;
 - stream lifecycle through `src/free_claude_code/core/anthropic/streaming`, including the neutral
-  stream ledger, Anthropic SSE emitter, native event normalization, retry
-  holdback, continuation, and tool repair;
+  stream ledger, Anthropic SSE emitter, native event normalization,
+  continuation-body construction, and tool repair;
 - native Anthropic stream policy;
-- token counting and user-facing error formatting.
+- token counting and Anthropic-owned failure-kind-to-wire mapping.
 
 Shared stream behavior lives under
 [src/free_claude_code/core/anthropic/streaming/](src/free_claude_code/core/anthropic/streaming/). The shared layer owns the
-Anthropic content-block ledger, SSE serialization, early retry classification,
-holdback buffering, retry attempt counting, common flush/discard behavior,
-midstream continuation, tool JSON repair, and final success/error tails. Provider
-transport packages are upstream adapters: OpenAI-chat providers convert chat
-chunks into ledger operations, and native Anthropic providers parse upstream SSE,
-apply native block policy, and re-emit normalized Anthropic SSE from the shared
-ledger. Transport bases stay focused on provider hooks, client setup, request
-construction, rate limiting, and model listing. Status-less upstream transient
-classification also lives in this shared layer so stream recovery, provider
-backoff, and provider error mapping agree on retryable overload/rate-limit
-signals.
+Anthropic content-block ledger, SSE serialization, continuation request
+transformations, and tool JSON repair. It does not import `httpx` or the OpenAI
+SDK and does not decide whether an upstream failure is retryable.
 
-Provider transports raise typed provider errors for final stream failures before
-any downstream-visible SSE chunk has escaped the recovery holdback. Once output
-has committed, transports keep ownership of midstream recovery, continuation,
-tool salvage, and protocol-specific success/error tails.
-The public streaming API boundary owns the final downstream error shape: provider
-errors remain visible to clients, but after FCC exhausts provider retry/recovery
-they are returned as typed HTTP errors with explicit retry suppression when the
-HTTP response is still uncommitted. Only already-committed streams use terminal
-protocol events.
+[core/failures.py](src/free_claude_code/core/failures.py) defines the immutable,
+protocol-neutral `FailureKind` and `ExecutionFailure`. The exception is the
+value propagated through async iterators; its semantic fields are immutable,
+while Python remains free to attach traceback/cause metadata during unwinding.
+[core/diagnostics.py](src/free_claude_code/core/diagnostics.py) owns bounded error
+body/cause extraction, credential redaction, safe traceback formatting, and
+copyable request-ID diagnostics. Anthropic and Responses packages independently
+map the canonical kind and status to their wire error types.
+
+[providers/failure_policy.py](src/free_claude_code/providers/failure_policy.py)
+is the only owner of raw OpenAI SDK and `httpx` exception classification,
+transient status/body inference, stable provider wording, and final diagnostic
+construction for those failures. Native Anthropic wire errors are instead
+mapped to canonical failures by the Anthropic protocol package, then consumed
+by provider retry/recovery policy.
+[providers/stream_recovery.py](src/free_claude_code/providers/stream_recovery.py)
+owns the 0.75-second/65,536-byte holdback, four transparent early retries after
+the first attempt, and five midstream recovery attempts. Provider opening keeps
+its existing five-attempt exponential-backoff budget. `ExecutionFailure.retryable`
+records provider-policy eligibility; it never tells the client to retry after FCC
+has finalized the failure.
+
+Provider transport packages remain upstream adapters: OpenAI-chat providers
+convert chat chunks into ledger operations, and native Anthropic providers parse
+upstream SSE and canonicalize upstream error events. After retry, continuation,
+and tool salvage are exhausted, a transport discards uncommitted output or
+flushes committed output, closes any open content blocks, and raises
+`ExecutionFailure`. It never synthesizes a terminal Anthropic error event.
+
+The public HTTP commit boundary solely decides whether a final failure can use
+non-2xx JSON or must use a terminal protocol event; the protocol packages own
+envelope and event serialization. Before the first public frame the boundary
+returns typed non-2xx JSON with `x-should-retry: false`; after the first frame
+Messages appends one Anthropic `event: error`, while Responses emits
+`response.failed` with the original response ID. Non-streaming Messages catches
+the same failure and discards its partial aggregate. Unexpected failures use the
+same commit-state split but do not acquire provider retry semantics.
 
 [src/free_claude_code/core/openai_responses/](src/free_claude_code/core/openai_responses/) owns OpenAI Responses support:
 
+- the permissive `OpenAIResponsesRequest` ingress model used directly by the
+  FastAPI route and the protocol adapter;
 - the `OpenAIResponsesAdapter` facade used by the API layer;
 - streaming-only `/v1/responses` support for Codex/FCC workflows;
 - Responses request conversion into Anthropic Messages payloads;
@@ -530,14 +614,18 @@ an OpenAI-shaped client error because installed FCC/Codex workflows only need
 streaming. Request conversion, stream transformation, Anthropic SSE parsing,
 Responses SSE event formatting, output item construction, tool identity mapping,
 reasoning mapping, ID generation, and error envelope construction each live
-behind the adapter boundary. `stream.py` is the public streaming entrypoint;
+behind the adapter boundary. The concrete request object crosses that boundary
+unchanged; nested Responses input and tool data stays permissive and is
+interpreted by the conversion functions. `stream.py` is the public streaming
+entrypoint;
 [src/free_claude_code/core/openai_responses/streaming/](src/free_claude_code/core/openai_responses/streaming/) owns the
 block-indexed Responses stream assembler. The package separates Anthropic SSE
 dispatch, block state, output ledger ordering, block completion, SSE event
 builders, and error mapping. API code should depend on the adapter, not on
 those internal module owners directly. Responses output payloads stay
-OpenAI-shaped; Anthropic terminal metadata is used internally only when it
-affects streamed behavior.
+OpenAI-shaped. Canonical execution failures enter the assembler directly, so
+Responses does not infer provider failure semantics by parsing an Anthropic
+terminal error.
 Post-start Responses failures are assembler-owned: the active
 `ResponsesStreamAssembler` emits `response.failed` so the terminal event keeps
 the same `response.id`, output ledger, and usage state as the earlier
@@ -595,14 +683,13 @@ Messages handler can stream local Anthropic server-tool responses without sendin
 request upstream. [api/web_tools/egress.py](src/free_claude_code/api/web_tools/egress.py) enforces URL
 scheme and private-network restrictions for `web_fetch`.
 
-OpenAI-chat upstream providers are identified by
-`ProviderDescriptor.transport_type == "openai_chat"` in
-[config/provider_catalog.py](src/free_claude_code/config/provider_catalog.py). They cannot safely
-represent Anthropic server-tool blocks, so the Messages handler rejects unsupported
-server-tool requests before provider execution instead of performing a lossy
-conversion. Forced `web_search` or `web_fetch` requests are handled locally when
-`ENABLE_WEB_SERVER_TOOLS` is true; otherwise OpenAI-chat upstreams reject them
-and the local native Anthropic Messages transports may receive them.
+The Messages handler reads the routed model's
+`ProviderCapabilities.server_tool_passthrough` value. Providers without this
+capability reject unsupported server-tool requests before execution instead of
+performing a lossy conversion. Forced `web_search` or `web_fetch` requests are
+handled locally when `ENABLE_WEB_SERVER_TOOLS` is true; when local handling is
+disabled, only providers declaring passthrough may receive those blocks. This
+keeps product policy independent of provider IDs and transport implementation.
 
 ## CLI Launchers And Managed Claude
 
@@ -654,9 +741,9 @@ the messaging bridge is skipped.
 
 `ApplicationRuntime` privately owns the selected platform runtime, the
 `MessagingWorkflow`, configured `Transcriber`, and managed CLI session manager.
-The workflow owns
-conversation snapshot restoration and final persistence flush. The API sees only
-the `SessionControlPort` used to preserve `/stop` behavior.
+The workflow owns conversation snapshot restoration and final persistence flush.
+The API sees only the application-owned `TaskController` used to preserve
+`/stop` behavior.
 
 The platform factory returns a `MessagingPlatformComponents` bundle from
 [messaging/platforms/ports.py](src/free_claude_code/messaging/platforms/ports.py): a

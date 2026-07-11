@@ -1,27 +1,27 @@
 """Shared transport for providers with native Anthropic Messages endpoints."""
 
+import sys
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 import httpx
 
+from free_claude_code.application.model_metadata import ProviderModelInfo
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.native_sse_block_policy import (
     NativeSseBlockPolicyState,
     transform_native_sse_block_event,
 )
 from free_claude_code.providers.base import BaseProvider, ProviderConfig
-from free_claude_code.providers.error_mapping import (
-    extract_provider_error_detail,
-    map_error,
-    user_visible_message_for_mapped_provider_error,
-)
 from free_claude_code.providers.model_listing import (
-    ProviderModelInfo,
     extract_openai_model_ids,
     model_infos_from_ids,
 )
 from free_claude_code.providers.rate_limit import ProviderRateLimiter
-from free_claude_code.providers.transports.http import maybe_await_aclose
+from free_claude_code.providers.transports.http import (
+    close_provider_stream,
+    maybe_await_aclose,
+)
 
 from .http import model_list_json, raise_for_status_with_body
 from .request_policy import (
@@ -110,7 +110,7 @@ class AnthropicMessagesTransport(BaseProvider):
         return {"Content-Type": "application/json"}
 
     def _build_request_body(
-        self, request: Any, thinking_enabled: bool | None = None
+        self, request: MessagesRequest, thinking_enabled: bool | None = None
     ) -> dict:
         """Build a native Anthropic request body."""
         thinking_enabled = self._is_thinking_enabled(request, thinking_enabled)
@@ -119,8 +119,14 @@ class AnthropicMessagesTransport(BaseProvider):
             thinking_enabled=thinking_enabled,
         )
 
+    def preflight_stream(
+        self, request: MessagesRequest, *, thinking_enabled: bool | None = None
+    ) -> None:
+        """Validate native Messages request construction before streaming."""
+        self._build_request_body(request, thinking_enabled=thinking_enabled)
+
     def _build_request_body_with_resolved_thinking(
-        self, request: Any, *, thinking_enabled: bool
+        self, request: MessagesRequest, *, thinking_enabled: bool
     ) -> dict:
         """Build a native Anthropic request body after thinking is resolved."""
         return build_native_messages_request_body(
@@ -154,7 +160,7 @@ class AnthropicMessagesTransport(BaseProvider):
             log_api_error_tracebacks=self._config.log_api_error_tracebacks,
         )
 
-    def _new_stream_state(self, request: Any, *, thinking_enabled: bool) -> Any:
+    def _new_stream_state(self) -> NativeSseBlockPolicyState | None:
         """Return per-stream provider state for event transformation."""
         if self.stream_chunk_mode == "line":
             return NativeSseBlockPolicyState()
@@ -174,24 +180,12 @@ class AnthropicMessagesTransport(BaseProvider):
             )
         return event
 
-    def _map_error_details(
-        self, error: Exception, request_id: str | None
-    ) -> tuple[Exception, str]:
-        """Map an exception into a user-facing provider error message."""
-        mapped_error = map_error(error, rate_limiter=self._rate_limiter)
-        return (
-            mapped_error,
-            user_visible_message_for_mapped_provider_error(
-                mapped_error,
-                provider_name=self._provider_name,
-                read_timeout_s=self._config.http_read_timeout,
-                detail=extract_provider_error_detail(error),
-                request_id=request_id,
-            ),
-        )
-
     async def _validated_stream_send(
-        self, body: dict, *, req_tag: str
+        self,
+        body: dict,
+        *,
+        req_tag: str,
+        request_id: str | None = None,
     ) -> httpx.Response:
         """Send request and raise mapped HTTP errors before yielding body chunks."""
         send_response = await self._send_stream_request(body)
@@ -200,12 +194,17 @@ class AnthropicMessagesTransport(BaseProvider):
                 await self._raise_for_status(send_response, req_tag=req_tag)
             finally:
                 if not send_response.is_closed:
-                    await maybe_await_aclose(send_response)
+                    await close_provider_stream(
+                        send_response,
+                        active_error=sys.exception(),
+                        provider_name=self._provider_name,
+                        request_id=request_id,
+                    )
         return send_response
 
     async def stream_response(
         self,
-        request: Any,
+        request: MessagesRequest,
         input_tokens: int = 0,
         *,
         request_id: str | None = None,

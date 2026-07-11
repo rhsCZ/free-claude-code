@@ -13,14 +13,16 @@ from free_claude_code.core.anthropic.stream_contracts import (
     parse_sse_text,
 )
 from free_claude_code.core.anthropic.streaming import (
-    MIDSTREAM_RECOVERY_ATTEMPTS,
     AnthropicStreamLedger,
-    TruncatedProviderStreamError,
     make_text_recovery_body,
 )
+from free_claude_code.core.failures import ExecutionFailure
 from free_claude_code.providers.base import ProviderConfig
-from free_claude_code.providers.exceptions import ProviderError
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
+from free_claude_code.providers.stream_recovery import (
+    MIDSTREAM_RECOVERY_ATTEMPTS,
+    TruncatedProviderStreamError,
+)
 from free_claude_code.providers.transports.openai_chat.recovery import (
     OpenAIChatRecovery,
 )
@@ -29,7 +31,7 @@ from free_claude_code.providers.transports.openai_chat.tool_calls import (
     has_committed_sse_output,
     iter_heuristic_tool_use_sse,
 )
-from tests.provider_request_mocks import make_openai_compat_stream_request
+from tests.providers.request_factory import make_messages_request
 from tests.providers.support import passthrough_rate_limiter
 
 
@@ -98,9 +100,21 @@ def _make_provider_with_thinking_enabled(enabled: bool):
     )
 
 
-def _make_request(model="test-model", stream=True):
-    """Create a mock request with all fields build_request_body needs."""
-    return make_openai_compat_stream_request(model=model, stream=stream)
+def _make_request(model: str = "test-model", stream: bool = True, **overrides: object):
+    """Create a concrete request matching the original streaming-test defaults."""
+    request_overrides: dict[str, object] = {
+        "messages": [],
+        "max_tokens": 4096,
+        "temperature": None,
+        "top_p": None,
+        "system": None,
+        "tools": None,
+        "extra_body": None,
+        "thinking": None,
+        "stream": stream,
+    }
+    request_overrides.update(overrides)
+    return make_messages_request(model, **request_overrides)
 
 
 def _make_chunk(
@@ -139,10 +153,20 @@ async def _collect_stream(provider, request):
     return [e async for e in provider.stream_response(request)]
 
 
-async def _collect_stream_error(provider, request, **kwargs) -> ProviderError:
-    with pytest.raises(ProviderError) as exc_info:
+async def _collect_stream_error(provider, request, **kwargs) -> ExecutionFailure:
+    with pytest.raises(ExecutionFailure) as exc_info:
         [e async for e in provider.stream_response(request, **kwargs)]
     return exc_info.value
+
+
+async def _collect_stream_and_error(
+    provider, request, **kwargs
+) -> tuple[list[str], ExecutionFailure]:
+    events: list[str] = []
+    with pytest.raises(ExecutionFailure) as exc_info:
+        async for event in provider.stream_response(request, **kwargs):
+            events.extend((event,))
+    return events, exc_info.value
 
 
 def _assert_no_content_deltas_after_error_text(
@@ -270,8 +294,8 @@ class TestStreamingExceptionHandling:
         assert "Connection lost" in error.message
 
     @pytest.mark.asyncio
-    async def test_error_after_native_tool_call_uses_top_level_error_event(self):
-        """After a streamed tool_call, do not append error text as a new assistant text block."""
+    async def test_error_after_native_tool_call_closes_block_then_raises(self):
+        """A provider closes tool state, then leaves terminal serialization to API."""
         provider = _make_provider()
         request = _make_request()
         tool_chunk = _make_tool_calls_chunk(
@@ -294,11 +318,14 @@ class TestStreamingExceptionHandling:
                 return_value=False,
             ),
         ):
-            events = await _collect_stream(provider, request)
+            events, error = await _collect_stream_and_error(provider, request)
         event_text = "".join(events)
+        parsed = parse_sse_text(event_text)
         assert "tool_use" in event_text
-        assert "Connection lost after tool" in event_text
-        assert "event: error\n" in event_text
+        assert parsed[-1].event == "content_block_stop"
+        assert "Connection lost after tool" in error.message
+        assert "Connection lost after tool" not in event_text
+        assert "event: error\n" not in event_text
         assert "message_stop" not in event_text
         _assert_error_not_in_text_deltas_after_tool(
             events, "Connection lost after tool"
@@ -617,8 +644,8 @@ class TestStreamingExceptionHandling:
         assert "Request ID: REQ_BODY" in stream_error.message
 
     @pytest.mark.asyncio
-    async def test_error_after_native_tool_call_top_level_error_includes_body(self):
-        """After a tool_use block, detailed provider errors remain top-level SSE errors."""
+    async def test_error_after_native_tool_call_failure_includes_body(self):
+        """Detailed failure data survives after the provider closes tool state."""
         provider = _make_provider()
         request = _make_request()
         tool_chunk = _make_tool_calls_chunk(
@@ -638,22 +665,22 @@ class TestStreamingExceptionHandling:
             new_callable=AsyncMock,
             return_value=stream_mock,
         ):
-            events = [
-                e
-                async for e in provider.stream_response(
-                    request,
-                    request_id="REQ_TOOL_BODY",
-                )
-            ]
+            events, stream_error = await _collect_stream_and_error(
+                provider,
+                request,
+                request_id="REQ_TOOL_BODY",
+            )
 
         event_text = "".join(events)
+        parsed = parse_sse_text(event_text)
         assert "tool_use" in event_text
-        assert "event: error\n" in event_text
-        assert "bad after tool" in event_text
-        assert "Request ID: REQ_TOOL_BODY" in event_text
+        assert parsed[-1].event == "content_block_stop"
+        assert "event: error\n" not in event_text
+        assert "bad after tool" not in event_text
+        assert "Request ID: REQ_TOOL_BODY" not in event_text
         assert "message_stop" not in event_text
-        terminal_error = parse_sse_text(event_text)[-1]
-        assert terminal_error.data["error"]["type"] == "invalid_request_error"
+        assert "bad after tool" in stream_error.message
+        assert "Request ID: REQ_TOOL_BODY" in stream_error.message
         _assert_error_not_in_text_deltas_after_tool(events, "bad after tool")
 
     @pytest.mark.asyncio
@@ -943,8 +970,8 @@ class TestStreamingExceptionHandling:
         assert "provider stream failed" in error.message.lower()
 
     @pytest.mark.asyncio
-    async def test_truncated_recovery_stream_falls_back_to_error_tail(self):
-        """Partial recovery bytes are not converted into a successful response."""
+    async def test_truncated_recovery_stream_closes_block_then_raises(self):
+        """Partial recovery bytes never become success or provider-owned wire errors."""
         provider = _make_provider()
         request = _make_request()
         original_text = "hello wor" + ("x" * 70_000)
@@ -966,16 +993,18 @@ class TestStreamingExceptionHandling:
                 ),
             ) as mock_collect,
         ):
-            events = await _collect_stream(provider, request)
+            events, error = await _collect_stream_and_error(provider, request)
 
         event_text = "".join(events)
         assert mock_create.await_count == 1
         assert mock_collect.await_count == 1
         assert original_text in event_text
         assert "world" not in event_text
-        assert "Provider stream ended without finish_reason." in event_text
+        assert "Provider stream ended without finish_reason." in error.message
+        assert "Provider stream ended without finish_reason." not in event_text
         parsed = parse_sse_text(event_text)
-        assert parsed[-1].event == "error"
+        assert parsed[-1].event == "content_block_stop"
+        assert not any(event.event == "error" for event in parsed)
         assert not any(event.event == "message_stop" for event in parsed)
         assert not any(
             event.event == "content_block_delta"
@@ -987,19 +1016,20 @@ class TestStreamingExceptionHandling:
     async def test_incomplete_tool_call_repair_appends_schema_valid_suffix(self):
         """A truncated tool JSON prefix is repaired append-only before tool_use tail."""
         provider = _make_provider()
-        request = _make_request()
-        request.tools = [
-            SimpleNamespace(
-                name="echo_smoke",
-                description="Echo",
-                input_schema={
-                    "type": "object",
-                    "properties": {"message": {"type": "string"}},
-                    "required": ["message"],
-                    "additionalProperties": False,
-                },
-            )
-        ]
+        request = _make_request(
+            tools=[
+                {
+                    "name": "echo_smoke",
+                    "description": "Echo",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        )
         tool_chunk = _make_tool_calls_chunk(
             name="echo_smoke", arguments='{"message":', tool_id="call_repair"
         )

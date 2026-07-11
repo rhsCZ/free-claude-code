@@ -1,12 +1,12 @@
 """Detect forced Anthropic web server tool requests."""
 
-from free_claude_code.api.models.anthropic import MessagesRequest, Tool
+from free_claude_code.core.anthropic import MessagesRequest, Tool
+
+from .parsers import content_text
 
 
 def request_text(request: MessagesRequest) -> str:
     """Join all user/assistant message content into one string for tool input parsing."""
-    from .parsers import content_text
-
     return "\n".join(content_text(message.content) for message in request.messages)
 
 
@@ -14,8 +14,6 @@ def forced_tool_turn_text(request: MessagesRequest) -> str:
     """Text for parsing forced server-tool inputs: latest user turn only (avoids stale history)."""
     if not request.messages:
         return ""
-
-    from .parsers import content_text
 
     for message in reversed(request.messages):
         if message.role == "user":
@@ -64,10 +62,10 @@ def has_listed_anthropic_server_tools(request: MessagesRequest) -> bool:
     return any(is_anthropic_server_tool_definition(t) for t in (request.tools or []))
 
 
-def openai_chat_upstream_server_tool_error(
+def unsupported_server_tool_error(
     request: MessagesRequest, *, web_tools_enabled: bool
 ) -> str | None:
-    """Return a user-facing error when OpenAI Chat upstream cannot satisfy server-tool semantics."""
+    """Return the user-facing error when the resolved provider cannot run server tools."""
     forced = forced_server_tool_name(request)
     if forced and not web_tools_enabled:
         return (

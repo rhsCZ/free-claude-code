@@ -8,12 +8,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import free_claude_code.api.web_tools.constants as web_tool_constants
 from free_claude_code.api.handlers import MessagesHandler
-from free_claude_code.api.model_router import (
-    ModelRouter,
-    ResolvedModel,
-    RoutedMessagesRequest,
-)
-from free_claude_code.api.models.anthropic import Message, MessagesRequest, Tool
 from free_claude_code.api.web_tools import egress as web_egress
 from free_claude_code.api.web_tools.egress import (
     WebFetchEgressPolicy,
@@ -27,38 +21,58 @@ from free_claude_code.api.web_tools.outbound import (
 )
 from free_claude_code.api.web_tools.request import is_web_server_tool_request
 from free_claude_code.api.web_tools.streaming import stream_web_server_tool_response
-from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
+from free_claude_code.application.errors import InvalidRequestError
+from free_claude_code.application.routing import (
+    ModelRouter,
+    ResolvedModel,
+    RoutedMessagesRequest,
+)
+from free_claude_code.config.provider_catalog import (
+    PROVIDER_CATALOG,
+    ProviderCapabilities,
+)
 from free_claude_code.config.settings import Settings
+from free_claude_code.core.anthropic.models import Message, MessagesRequest, Tool
 from free_claude_code.core.anthropic.stream_contracts import (
     assert_anthropic_stream_contract,
     parse_sse_text,
     text_content,
 )
 from free_claude_code.messaging.event_parser import parse_cli_event
-from free_claude_code.providers.exceptions import InvalidRequestError
 
 _STRICT_EGRESS = WebFetchEgressPolicy(
     allow_private_network_targets=False,
     allowed_schemes=frozenset({"http", "https"}),
 )
-_OPENAI_CHAT_PROVIDER_IDS = tuple(
+_NO_SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS = tuple(
     provider_id
     for provider_id, descriptor in PROVIDER_CATALOG.items()
-    if descriptor.transport_type == "openai_chat"
+    if not descriptor.capabilities.server_tool_passthrough
 )
-_ANTHROPIC_MESSAGES_PROVIDER_IDS = tuple(
+_SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS = tuple(
     provider_id
     for provider_id, descriptor in PROVIDER_CATALOG.items()
-    if descriptor.transport_type == "anthropic_messages"
+    if descriptor.capabilities.server_tool_passthrough
 )
 
 
 class FixedProviderModelRouter(ModelRouter):
-    """Test double: pin ``provider_id`` for OpenAI vs native routing assertions."""
+    """Test double: pin provider identity and semantic capabilities."""
 
-    def __init__(self, settings: Settings, provider_id: str) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        provider_id: str,
+        *,
+        capabilities: ProviderCapabilities | None = None,
+    ) -> None:
         super().__init__(settings)
         self._fixed_provider_id = provider_id
+        self._fixed_capabilities = (
+            PROVIDER_CATALOG[provider_id].capabilities
+            if capabilities is None
+            else capabilities
+        )
 
     def resolve_messages_request(
         self, request: MessagesRequest
@@ -69,6 +83,7 @@ class FixedProviderModelRouter(ModelRouter):
             provider_model=request.model,
             provider_model_ref=f"{self._fixed_provider_id}/{request.model}",
             thinking_enabled=False,
+            capabilities=self._fixed_capabilities,
         )
         routed = request.model_copy(deep=True)
         routed.model = resolved.provider_model
@@ -112,16 +127,16 @@ def test_web_server_tool_not_detected_when_forced_name_missing_from_tools():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider_id", _OPENAI_CHAT_PROVIDER_IDS)
-async def test_service_rejects_forced_server_tool_on_openai_when_disabled(
+@pytest.mark.parametrize("provider_id", _NO_SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS)
+async def test_service_rejects_forced_server_tool_without_passthrough_when_disabled(
     provider_id: str,
 ):
-    """OpenAI Chat upstreams cannot run forced server tools without the local handler."""
+    """Non-passthrough providers need the local handler for forced server tools."""
     settings = Settings()
     assert settings.enable_web_server_tools is False
     service = MessagesHandler(
         settings,
-        provider_getter=lambda _: MagicMock(),
+        provider_resolver=lambda _: MagicMock(),
         model_router=FixedProviderModelRouter(settings, provider_id),
     )
     request = MessagesRequest(
@@ -417,11 +432,13 @@ async def test_service_streams_forced_web_search_by_default(monkeypatch):
         "free_claude_code.api.web_tools.outbound._run_web_search", fake_search
     )
     settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": True})
-    provider_getter = MagicMock()
+    provider_resolver = MagicMock()
     service = MessagesHandler(
         settings,
-        provider_getter=provider_getter,
-        model_router=FixedProviderModelRouter(settings, _OPENAI_CHAT_PROVIDER_IDS[0]),
+        provider_resolver=provider_resolver,
+        model_router=FixedProviderModelRouter(
+            settings, _NO_SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS[0]
+        ),
     )
     request = MessagesRequest(
         model="claude-haiku-4-5-20251001",
@@ -438,7 +455,7 @@ async def test_service_streams_forced_web_search_by_default(monkeypatch):
     raw = await _streaming_body_text(response)
     assert "event: message_start" in raw
     assert "DeepSeek V4 Released" in raw
-    provider_getter.assert_not_called()
+    provider_resolver.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -450,11 +467,13 @@ async def test_service_aggregates_forced_web_search_when_stream_false(monkeypatc
         "free_claude_code.api.web_tools.outbound._run_web_search", fake_search
     )
     settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": True})
-    provider_getter = MagicMock()
+    provider_resolver = MagicMock()
     service = MessagesHandler(
         settings,
-        provider_getter=provider_getter,
-        model_router=FixedProviderModelRouter(settings, _OPENAI_CHAT_PROVIDER_IDS[0]),
+        provider_resolver=provider_resolver,
+        model_router=FixedProviderModelRouter(
+            settings, _NO_SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS[0]
+        ),
     )
     request = MessagesRequest(
         model="claude-haiku-4-5-20251001",
@@ -478,7 +497,7 @@ async def test_service_aggregates_forced_web_search_when_stream_false(monkeypatc
     assert body["content"][1]["content"][0]["url"] == "https://example.com/v4"
     assert "DeepSeek V4 Released" in body["content"][2]["text"]
     assert body["usage"]["server_tool_use"] == {"web_search_requests": 1}
-    provider_getter.assert_not_called()
+    provider_resolver.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -541,11 +560,13 @@ async def test_service_aggregates_forced_web_fetch_when_stream_false(monkeypatch
         "free_claude_code.api.web_tools.outbound._run_web_fetch", fake_fetch
     )
     settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": True})
-    provider_getter = MagicMock()
+    provider_resolver = MagicMock()
     service = MessagesHandler(
         settings,
-        provider_getter=provider_getter,
-        model_router=FixedProviderModelRouter(settings, _OPENAI_CHAT_PROVIDER_IDS[0]),
+        provider_resolver=provider_resolver,
+        model_router=FixedProviderModelRouter(
+            settings, _NO_SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS[0]
+        ),
     )
     request = MessagesRequest(
         model="claude-haiku-4-5-20251001",
@@ -569,7 +590,7 @@ async def test_service_aggregates_forced_web_fetch_when_stream_false(monkeypatch
     assert body["content"][1]["content"]["content"]["title"] == "Example Article"
     assert body["content"][2]["text"] == "Article body"
     assert body["usage"]["server_tool_use"] == {"web_fetch_requests": 1}
-    provider_getter.assert_not_called()
+    provider_resolver.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -752,14 +773,14 @@ async def test_drain_response_body_capped_stops_after_first_chunk_when_oversized
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider_id", _OPENAI_CHAT_PROVIDER_IDS)
-async def test_service_rejects_listed_server_tools_on_openai_chat(
+@pytest.mark.parametrize("provider_id", _NO_SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS)
+async def test_service_rejects_listed_server_tools_without_passthrough(
     provider_id: str,
 ) -> None:
     settings = Settings()
     service = MessagesHandler(
         settings,
-        provider_getter=lambda _: MagicMock(),
+        provider_resolver=lambda _: MagicMock(),
         model_router=FixedProviderModelRouter(settings, provider_id),
     )
     request = MessagesRequest(
@@ -773,11 +794,11 @@ async def test_service_rejects_listed_server_tools_on_openai_chat(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider_id", _ANTHROPIC_MESSAGES_PROVIDER_IDS)
-async def test_listed_server_tools_routed_on_anthropic_messages_providers(
+@pytest.mark.parametrize("provider_id", _SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS)
+async def test_listed_server_tools_routed_on_passthrough_providers(
     provider_id: str,
 ) -> None:
-    """Native Anthropic transports may receive listed server tool definitions."""
+    """Passthrough providers may receive listed server tool definitions."""
     settings = Settings()
 
     async def fake_stream(*_a, **_k):
@@ -788,7 +809,7 @@ async def test_listed_server_tools_routed_on_anthropic_messages_providers(
     mock_provider.stream_response = fake_stream
     service = MessagesHandler(
         settings,
-        provider_getter=lambda _: mock_provider,
+        provider_resolver=lambda _: mock_provider,
         model_router=FixedProviderModelRouter(settings, provider_id),
     )
     request = MessagesRequest(
@@ -802,11 +823,11 @@ async def test_listed_server_tools_routed_on_anthropic_messages_providers(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider_id", _ANTHROPIC_MESSAGES_PROVIDER_IDS)
-async def test_forced_server_tools_routed_on_anthropic_messages_providers_when_local_disabled(
+@pytest.mark.parametrize("provider_id", _SERVER_TOOL_PASSTHROUGH_PROVIDER_IDS)
+async def test_forced_server_tools_routed_on_passthrough_providers_when_local_disabled(
     provider_id: str,
 ) -> None:
-    """Native Anthropic transports may receive forced server tools when local tools are off."""
+    """Passthrough providers may receive forced server tools when local tools are off."""
     settings = Settings()
 
     async def fake_stream(*_a, **_k):
@@ -817,7 +838,7 @@ async def test_forced_server_tools_routed_on_anthropic_messages_providers_when_l
     mock_provider.stream_response = fake_stream
     service = MessagesHandler(
         settings,
-        provider_getter=lambda _: mock_provider,
+        provider_resolver=lambda _: mock_provider,
         model_router=FixedProviderModelRouter(settings, provider_id),
     )
     request = MessagesRequest(
@@ -829,3 +850,67 @@ async def test_forced_server_tools_routed_on_anthropic_messages_providers_when_l
     )
     await service.create(request)
     mock_provider.preflight_stream.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_server_tool_policy_accepts_capability_not_identity() -> None:
+    provider_id = "nvidia_nim"
+    assert not PROVIDER_CATALOG[provider_id].capabilities.server_tool_passthrough
+
+    async def fake_stream(*_a, **_k):
+        yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+        yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    mock_provider = MagicMock()
+    mock_provider.stream_response = fake_stream
+    provider_resolver = MagicMock(return_value=mock_provider)
+    settings = Settings()
+    service = MessagesHandler(
+        settings,
+        provider_resolver=provider_resolver,
+        model_router=FixedProviderModelRouter(
+            settings,
+            provider_id,
+            capabilities=ProviderCapabilities(server_tool_passthrough=True),
+        ),
+    )
+    request = MessagesRequest(
+        model="m",
+        max_tokens=20,
+        messages=[Message(role="user", content="q")],
+        tools=[Tool(name="web_search", type="web_search_20250305")],
+    )
+
+    await service.create(request)
+
+    provider_resolver.assert_called_once_with(provider_id)
+    mock_provider.preflight_stream.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_server_tool_policy_rejects_capability_not_identity() -> None:
+    provider_id = "ollama"
+    assert PROVIDER_CATALOG[provider_id].capabilities.server_tool_passthrough
+
+    provider_resolver = MagicMock()
+    settings = Settings()
+    service = MessagesHandler(
+        settings,
+        provider_resolver=provider_resolver,
+        model_router=FixedProviderModelRouter(
+            settings,
+            provider_id,
+            capabilities=ProviderCapabilities(server_tool_passthrough=False),
+        ),
+    )
+    request = MessagesRequest(
+        model="m",
+        max_tokens=20,
+        messages=[Message(role="user", content="q")],
+        tools=[Tool(name="web_search", type="web_search_20250305")],
+    )
+
+    with pytest.raises(InvalidRequestError, match="OpenAI Chat upstreams"):
+        await service.create(request)
+
+    provider_resolver.assert_not_called()

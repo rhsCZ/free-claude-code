@@ -3,23 +3,24 @@
 from fastapi import HTTPException
 from loguru import logger
 
-from free_claude_code.api.model_router import ModelRouter
-from free_claude_code.api.models.anthropic import TokenCountRequest
-from free_claude_code.api.models.responses import TokenCountResponse
-from free_claude_code.api.provider_execution import TokenCounter
 from free_claude_code.api.request_errors import (
     http_status_for_unexpected_api_exception,
     log_unexpected_api_exception,
     require_non_empty_messages,
 )
 from free_claude_code.api.request_ids import new_request_id
+from free_claude_code.application.errors import ApplicationError
+from free_claude_code.application.execution import TokenCounter
+from free_claude_code.application.routing import ModelRouter
 from free_claude_code.config.settings import Settings
 from free_claude_code.core.anthropic import (
+    TokenCountRequest,
+    TokenCountResponse,
+    anthropic_request_snapshot,
     get_token_count,
-    get_user_facing_error_message,
 )
-from free_claude_code.core.trace import api_messages_request_snapshot, trace_event
-from free_claude_code.providers.exceptions import ProviderError
+from free_claude_code.core.diagnostics import safe_exception_message
+from free_claude_code.core.trace import trace_event
 
 
 class TokenCountHandler:
@@ -66,10 +67,10 @@ class TokenCountHandler:
                     request_id=request_id,
                     message_count=len(routed.request.messages),
                     input_tokens=tokens,
-                    snapshot=api_messages_request_snapshot(routed.request),
+                    snapshot=anthropic_request_snapshot(routed.request),
                 )
                 return TokenCountResponse(input_tokens=tokens)
-            except ProviderError:
+            except ApplicationError:
                 raise
             except Exception as exc:
                 log_unexpected_api_exception(
@@ -80,5 +81,5 @@ class TokenCountHandler:
                 )
                 raise HTTPException(
                     status_code=http_status_for_unexpected_api_exception(exc),
-                    detail=get_user_facing_error_message(exc),
+                    detail=safe_exception_message(exc),
                 ) from exc

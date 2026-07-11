@@ -3,19 +3,22 @@
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.streaming import (
-    MIDSTREAM_RECOVERY_ATTEMPTS,
     AnthropicStreamLedger,
-    TruncatedProviderStreamError,
     accept_tool_json_repair,
     continuation_suffix,
-    is_retryable_stream_error,
     make_text_recovery_body,
     make_tool_repair_body,
     parse_complete_tool_input,
     tool_schemas_by_name,
 )
 from free_claude_code.core.trace import trace_event
+from free_claude_code.providers.stream_recovery import (
+    MIDSTREAM_RECOVERY_ATTEMPTS,
+    TruncatedProviderStreamError,
+    is_retryable_stream_error,
+)
 from free_claude_code.providers.transports.http import maybe_await_aclose
 
 from .tool_calls import all_emitted_tools_complete, started_tool_states
@@ -86,7 +89,7 @@ class OpenAIChatRecovery:
         *,
         body: dict[str, Any],
         ledger: AnthropicStreamLedger,
-        request: Any,
+        request: MessagesRequest,
         request_id: str | None,
         error: Exception,
         tool_argument_alias_buffers: dict[int, str],
@@ -166,7 +169,7 @@ class OpenAIChatRecovery:
         *,
         body: dict[str, Any],
         ledger: AnthropicStreamLedger,
-        request: Any,
+        request: MessagesRequest,
         tool_argument_alias_buffers: dict[int, str],
     ) -> list[str] | None:
         schemas = tool_schemas_by_name(request)

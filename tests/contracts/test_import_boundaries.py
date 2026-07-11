@@ -3,17 +3,6 @@
 import ast
 from pathlib import Path
 
-# `free_claude_code.api` may only import this narrow ``providers`` surface.
-_API_ALLOWED_PROVIDER_MODULES = frozenset(
-    {
-        "free_claude_code.providers",
-        "free_claude_code.providers.base",
-        "free_claude_code.providers.exceptions",
-        "free_claude_code.providers.model_listing",
-        "free_claude_code.providers.runtime",
-    }
-)
-
 _PACKAGE_ROOT = Path("src") / "free_claude_code"
 
 
@@ -54,6 +43,7 @@ def test_runtime_packages_live_only_under_src_namespace() -> None:
 
     assert (package_root / "__init__.py").exists()
     for package_name in {
+        "application",
         "api",
         "cli",
         "config",
@@ -69,6 +59,7 @@ def test_runtime_packages_live_only_under_src_namespace() -> None:
 def test_no_old_top_level_first_party_imports_remain() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     forbidden = {
+        "application",
         "api",
         "cli",
         "config",
@@ -123,12 +114,76 @@ def test_provider_adapters_do_not_import_runtime_layers() -> None:
     assert offenders == []
 
 
+def test_anthropic_request_boundaries_use_the_protocol_model() -> None:
+    """Known Messages fields must not cross core/provider boundaries by duck typing."""
+    repo_root = Path(__file__).resolve().parents[2]
+    roots = [
+        repo_root / "src" / "free_claude_code" / "core" / "anthropic",
+        repo_root / "src" / "free_claude_code" / "providers",
+    ]
+    request_names = {"request", "request_data"}
+    protocol_fields = {
+        "extra_body",
+        "max_tokens",
+        "messages",
+        "model",
+        "stop_sequences",
+        "system",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "tools",
+        "top_k",
+        "top_p",
+    }
+    offenders: list[str] = []
+
+    for root in roots:
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            relative = path.relative_to(repo_root).as_posix()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    arguments = [
+                        *node.args.posonlyargs,
+                        *node.args.args,
+                        *node.args.kwonlyargs,
+                    ]
+                    for argument in arguments:
+                        if argument.arg.lstrip("_") not in request_names:
+                            continue
+                        if isinstance(argument.annotation, ast.Name) and (
+                            argument.annotation.id == "Any"
+                        ):
+                            offenders.append(
+                                f"{relative}:{argument.lineno}: "
+                                f"{node.name}({argument.arg}: Any)"
+                            )
+                if not isinstance(node, ast.Call) or not (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id.lstrip("_") in request_names
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value in protocol_fields
+                ):
+                    continue
+                offenders.append(
+                    f"{relative}:{node.lineno}: "
+                    f"getattr({node.args[0].id}, {node.args[1].value!r})"
+                )
+
+    assert sorted(offenders) == []
+
+
 def test_core_does_not_import_product_packages() -> None:
     """Neutral ``core`` must stay independent of API, workers, and providers."""
     repo_root = Path(__file__).resolve().parents[2]
     offenders = _imports_matching(
         [repo_root / "src" / "free_claude_code" / "core"],
         forbidden_prefixes=(
+            "free_claude_code.application.",
             "free_claude_code.api.",
             "free_claude_code.messaging.",
             "free_claude_code.cli.",
@@ -138,6 +193,103 @@ def test_core_does_not_import_product_packages() -> None:
         ),
     )
     assert offenders == []
+
+
+def test_core_does_not_import_provider_transport_sdks() -> None:
+    """Provider SDK and HTTP failure policy belongs under ``providers``."""
+    repo_root = Path(__file__).resolve().parents[2]
+    offenders = _imports_matching(
+        [repo_root / "src" / "free_claude_code" / "core"],
+        forbidden_prefixes=("httpx", "openai"),
+    )
+    assert offenders == []
+
+
+def test_providers_do_not_own_wire_error_type_literals() -> None:
+    """Provider failures carry semantic kinds, never protocol error names."""
+    repo_root = Path(__file__).resolve().parents[2]
+    providers_root = repo_root / "src" / "free_claude_code" / "providers"
+    wire_types = {
+        "api_error",
+        "authentication_error",
+        "billing_error",
+        "invalid_request_error",
+        "not_found_error",
+        "overloaded_error",
+        "permission_error",
+        "rate_limit_error",
+        "request_too_large",
+        "timeout_error",
+    }
+    offenders: list[str] = []
+    for path in providers_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        offenders.extend(
+            f"{path.relative_to(repo_root).as_posix()}:{node.lineno}: {node.value}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value in wire_types
+        )
+    assert offenders == []
+
+
+def test_application_owns_routing_execution_and_consumer_ports() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    package_root = repo_root / "src" / "free_claude_code"
+    application_root = package_root / "application"
+    api_root = package_root / "api"
+
+    for filename in {
+        "__init__.py",
+        "execution.py",
+        "model_metadata.py",
+        "ports.py",
+        "routing.py",
+    }:
+        assert (application_root / filename).exists()
+
+    assert not (api_root / "model_router.py").exists()
+    assert not (api_root / "provider_execution.py").exists()
+    assert (
+        _imports_matching(
+            [application_root],
+            forbidden_prefixes=(
+                "free_claude_code.api.",
+                "free_claude_code.cli.",
+                "free_claude_code.messaging.",
+                "free_claude_code.providers.",
+                "free_claude_code.runtime.",
+            ),
+        )
+        == []
+    )
+
+    provider_imports = _imports_matching(
+        [api_root],
+        forbidden_prefixes=(
+            "free_claude_code.providers.base",
+            "free_claude_code.providers.model_listing",
+            "free_claude_code.providers.runtime",
+        ),
+    )
+    assert provider_imports == []
+
+    unexpected_provider_application_imports: list[str] = []
+    providers_root = package_root / "providers"
+    for path in providers_root.rglob("*.py"):
+        for imported in _imports_from(path, repo_root):
+            if imported is None or not imported.startswith(
+                "free_claude_code.application."
+            ):
+                continue
+            if imported in {
+                "free_claude_code.application.errors",
+                "free_claude_code.application.model_metadata",
+            }:
+                continue
+            unexpected_provider_application_imports.append(
+                f"{path.relative_to(repo_root)}: {imported}"
+            )
+    assert unexpected_provider_application_imports == []
 
 
 def test_provider_catalog_is_single_source_for_supported_ids() -> None:
@@ -296,7 +448,11 @@ def test_single_owner_runtime_dependency_direction() -> None:
         assert removed_state not in api_text
     assert "app.state.services" in api_text
 
-    for marker in {api_root / "__init__.py", runtime_root / "__init__.py"}:
+    for marker in {
+        package_root / "application" / "__init__.py",
+        api_root / "__init__.py",
+        runtime_root / "__init__.py",
+    }:
         marker_text = marker.read_text(encoding="utf-8")
         assert "from " not in marker_text
         assert "import " not in marker_text
@@ -324,22 +480,14 @@ def test_neutral_moved_helpers_keep_their_dependency_boundaries() -> None:
     )
 
 
-def test_api_may_only_import_narrow_provider_facade() -> None:
-    """HTTP layer must not depend on per-adapter provider subpackages."""
+def test_api_does_not_import_provider_implementation_packages() -> None:
+    """HTTP adapters depend on application contracts, never provider internals."""
     repo_root = Path(__file__).resolve().parents[2]
-    offenders: list[str] = []
-    for path in (repo_root / "src" / "free_claude_code" / "api").rglob("*.py"):
-        for imported in _imports_from(path, repo_root):
-            if imported is None or not imported.startswith(
-                "free_claude_code.providers"
-            ):
-                continue
-            if imported in _API_ALLOWED_PROVIDER_MODULES:
-                continue
-            if imported.startswith("free_claude_code.providers."):
-                rel = path.relative_to(repo_root)
-                offenders.append(f"{rel}: {imported}")
-    assert sorted(offenders) == []
+    offenders = _imports_matching(
+        [repo_root / "src" / "free_claude_code" / "api"],
+        forbidden_prefixes=("free_claude_code.providers",),
+    )
+    assert offenders == []
 
 
 def test_removed_openrouter_rollback_transport_stays_removed() -> None:
@@ -376,20 +524,6 @@ def test_provider_transports_live_under_transport_family_packages() -> None:
         ),
     )
     assert offenders == []
-
-
-def test_native_anthropic_transport_is_local_provider_only() -> None:
-    from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
-
-    native_ids = {
-        provider_id
-        for provider_id, descriptor in PROVIDER_CATALOG.items()
-        if descriptor.transport_type == "anthropic_messages"
-    }
-
-    assert native_ids == {"llamacpp", "ollama"}
-    for provider_id in native_ids:
-        assert "local" in PROVIDER_CATALOG[provider_id].capabilities
 
 
 def test_cloud_providers_do_not_import_native_anthropic_transport() -> None:
@@ -457,51 +591,41 @@ def test_anthropic_core_has_no_cloud_provider_native_policy() -> None:
     assert occurrences == []
 
 
-def test_anthropic_stream_engine_owns_provider_stream_state() -> None:
+def test_protocol_stream_state_and_provider_recovery_have_separate_owners() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    anthropic_root = repo_root / "src" / "free_claude_code" / "core" / "anthropic"
-    streaming_root = anthropic_root / "streaming"
+    package_root = repo_root / "src" / "free_claude_code"
+    streaming_root = package_root / "core" / "anthropic" / "streaming"
+    providers_root = package_root / "providers"
+    stream_recovery = providers_root / "stream_recovery.py"
 
-    for removed in {
-        "sse.py",
-        "emitted_sse_tracker.py",
-        "stream_recovery.py",
-        "stream_recovery_session.py",
-    }:
-        assert not (anthropic_root / removed).exists()
-
-    for filename in {
-        "__init__.py",
-        "emitter.py",
-        "ledger.py",
-        "lifecycle.py",
-        "recovery.py",
-    }:
-        assert (streaming_root / filename).exists()
-
-    forbidden = (
-        "SSEBuilder",
-        "ContentBlockManager",
-        "ToolCallState",
-        "EmittedNativeSseTracker",
-        "StreamRecoverySession",
-        "OpenAIChatStreamRunner",
-        "AnthropicMessagesStreamRunner",
-    )
-    offenders: list[str] = []
-    for path in [
-        *anthropic_root.rglob("*.py"),
-        *(repo_root / "src" / "free_claude_code" / "providers" / "transports").rglob(
-            "*.py"
-        ),
-    ]:
-        text = path.read_text(encoding="utf-8")
-        offenders.extend(
-            f"{path.relative_to(repo_root)}: {name}"
-            for name in forbidden
-            if name in text
+    assert (
+        _imports_matching(
+            [streaming_root],
+            forbidden_prefixes=("free_claude_code.providers",),
         )
-    assert sorted(offenders) == []
+        == []
+    )
+    assert "free_claude_code.providers.failure_policy" in set(
+        _imports_from(stream_recovery, repo_root)
+    )
+
+    streaming_exports = (streaming_root / "__init__.py").read_text(encoding="utf-8")
+    for provider_owned_name in {
+        "RecoveryController",
+        "RecoveryFailureAction",
+        "RecoveryHoldbackBuffer",
+        "is_retryable_stream_error",
+    }:
+        assert provider_owned_name not in streaming_exports
+
+    for transport in {"openai_chat", "anthropic_messages"}:
+        imports = set(
+            _imports_from(
+                providers_root / "transports" / transport / "stream.py",
+                repo_root,
+            )
+        )
+        assert "free_claude_code.providers.stream_recovery" in imports
 
 
 def test_openai_responses_uses_adapter_boundary() -> None:
@@ -527,6 +651,7 @@ def test_openai_responses_uses_adapter_boundary() -> None:
         "ids.py",
         "input.py",
         "items.py",
+        "models.py",
         "reasoning.py",
         "stream.py",
         "tools.py",
@@ -548,10 +673,19 @@ def test_openai_responses_uses_adapter_boundary() -> None:
 
     responses_handler = handlers_root / "responses.py"
     responses_handler_text = responses_handler.read_text(encoding="utf-8")
-    assert (
-        "from free_claude_code.core.openai_responses import OpenAIResponsesAdapter"
-        in responses_handler_text
+    assert "free_claude_code.core.openai_responses" in set(
+        _imports_from(responses_handler, repo_root)
     )
+    assert "OpenAIResponsesAdapter" in responses_handler_text
+    assert "OpenAIResponsesRequest" in responses_handler_text
+    assert not (
+        repo_root
+        / "src"
+        / "free_claude_code"
+        / "api"
+        / "models"
+        / "openai_responses.py"
+    ).exists()
     routes_text = (
         repo_root / "src" / "free_claude_code" / "api" / "routes.py"
     ).read_text(encoding="utf-8")
@@ -578,13 +712,16 @@ def test_openai_responses_uses_adapter_boundary() -> None:
                 offenders.append(f"{rel}: {imported}")
     assert sorted(offenders) == []
 
-    adapter_importers: list[str] = []
+    responses_importers: list[str] = []
     for path in (repo_root / "src" / "free_claude_code" / "api").rglob("*.py"):
         imports = set(_imports_from(path, repo_root))
         if "free_claude_code.core.openai_responses" in imports:
-            adapter_importers.append(path.relative_to(repo_root).as_posix())
-    assert sorted(adapter_importers) == [
-        "src/free_claude_code/api/handlers/responses.py"
+            responses_importers.append(path.relative_to(repo_root).as_posix())
+    assert sorted(responses_importers) == [
+        "src/free_claude_code/api/app.py",
+        "src/free_claude_code/api/handlers/responses.py",
+        "src/free_claude_code/api/request_errors.py",
+        "src/free_claude_code/api/routes.py",
     ]
 
     response_handler_imports = set(_imports_from(responses_handler, repo_root))
@@ -595,9 +732,9 @@ def test_openai_responses_uses_adapter_boundary() -> None:
     }:
         assert forbidden not in response_handler_imports
 
-    provider_execution_text = (api_root / "provider_execution.py").read_text(
-        encoding="utf-8"
-    )
+    provider_execution_text = (
+        repo_root / "src" / "free_claude_code" / "application" / "execution.py"
+    ).read_text(encoding="utf-8")
     assert "StreamingResponse" not in provider_execution_text
     assert "OpenAIResponsesAdapter" not in provider_execution_text
 

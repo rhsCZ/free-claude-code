@@ -10,17 +10,16 @@ import pytest
 
 from free_claude_code.config.constants import NATIVE_MESSAGES_ERROR_BODY_LOG_CAP_BYTES
 from free_claude_code.config.nim import NimSettings
+from free_claude_code.core.failures import ExecutionFailure
 from free_claude_code.providers.base import ProviderConfig
-from free_claude_code.providers.exceptions import ProviderError
 from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
 from free_claude_code.providers.transports.anthropic_messages import (
     stream as native_stream,
 )
-from tests.provider_request_mocks import make_openai_compat_stream_request
+from tests.providers.request_factory import make_messages_request
 from tests.providers.support import passthrough_rate_limiter
 from tests.providers.test_anthropic_messages import (
     FakeResponse,
-    MockRequest,
     NativeProvider,
 )
 
@@ -47,7 +46,7 @@ async def test_native_non_200_logs_exclude_body_text_by_default(
         provider_config,
         rate_limiter=passthrough_rate_limiter(),
     )
-    req = MockRequest()
+    req = make_messages_request()
     response = FakeResponse(status_code=500, text="SECRET_UPSTREAM_BODY")
 
     with (
@@ -59,7 +58,7 @@ async def test_native_non_200_logs_exclude_body_text_by_default(
             return_value=response,
         ),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
@@ -76,8 +75,11 @@ async def test_native_non_200_logs_body_when_verbose(caplog, provider_config):
         provider_config,
         rate_limiter=passthrough_rate_limiter(),
     )
-    req = MockRequest()
-    response = FakeResponse(status_code=500, text="SECRET_UPSTREAM_BODY")
+    req = make_messages_request()
+    response = FakeResponse(
+        status_code=500,
+        text="api_key=SECRET_UPSTREAM_BODY useful native detail",
+    )
 
     with (
         patch.object(provider._client, "build_request", return_value=MagicMock()),
@@ -88,12 +90,14 @@ async def test_native_non_200_logs_body_when_verbose(caplog, provider_config):
             return_value=response,
         ),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
     messages = " | ".join(r.getMessage() for r in caplog.records)
-    assert "SECRET_UPSTREAM_BODY" in messages
+    assert "api_key=<redacted>" in messages
+    assert "useful native detail" in messages
+    assert "SECRET_UPSTREAM_BODY" not in messages
     assert "truncated=False" in messages
 
 
@@ -106,7 +110,7 @@ async def test_native_non_200_verbose_logs_only_capped_error_body(
         provider_config,
         rate_limiter=passthrough_rate_limiter(),
     )
-    req = MockRequest()
+    req = make_messages_request()
     tail = "SECRET_TAIL_NOT_LOGGED"
     huge = f"{'A' * (NATIVE_MESSAGES_ERROR_BODY_LOG_CAP_BYTES + 50)}{tail}"
     response = FakeResponse(status_code=500, text=huge)
@@ -120,7 +124,7 @@ async def test_native_non_200_verbose_logs_only_capped_error_body(
             return_value=response,
         ),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
@@ -138,7 +142,7 @@ async def test_native_non_200_default_does_not_read_oversized_body(
         provider_config,
         rate_limiter=passthrough_rate_limiter(),
     )
-    req = MockRequest()
+    req = make_messages_request()
     huge = f"{'Z' * 500_000}LEAK_MARKER"
     response = FakeResponse(status_code=500, text=huge)
 
@@ -151,7 +155,7 @@ async def test_native_non_200_default_does_not_read_oversized_body(
             return_value=response,
         ),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
@@ -169,7 +173,7 @@ async def test_native_stream_failure_logs_exclude_exception_str_by_default(
         provider_config,
         rate_limiter=passthrough_rate_limiter(),
     )
-    req = MockRequest()
+    req = make_messages_request()
     response = FakeResponse(
         lines=[
             "event: ping",
@@ -193,7 +197,7 @@ async def test_native_stream_failure_logs_exclude_exception_str_by_default(
         ),
         patch.object(native_stream, "iter_sse_events", boom),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
@@ -201,6 +205,51 @@ async def test_native_stream_failure_logs_exclude_exception_str_by_default(
     assert "SECRET_DETAIL" not in messages
     assert "exc_type=RuntimeError" in messages
     assert "http_status=None" in messages
+
+
+@pytest.mark.asyncio
+async def test_native_stream_failure_verbose_traceback_redacts_credentials(
+    caplog, provider_config
+):
+    provider_config.log_api_error_tracebacks = True
+    provider = NativeProvider(
+        provider_config,
+        rate_limiter=passthrough_rate_limiter(),
+    )
+    req = make_messages_request()
+    response = FakeResponse(
+        lines=[
+            "event: ping",
+            '{"type":"ping"}',
+            "",
+        ]
+    )
+
+    async def boom(_response):
+        raise RuntimeError(
+            "authorization: Bearer NATIVE_TRACE_SECRET useful traceback detail"
+        )
+        if False:
+            yield ""
+
+    with (
+        patch.object(provider._client, "build_request", return_value=MagicMock()),
+        patch.object(
+            provider._client,
+            "send",
+            new_callable=AsyncMock,
+            return_value=response,
+        ),
+        patch.object(native_stream, "iter_sse_events", boom),
+        caplog.at_level(logging.ERROR),
+        pytest.raises(ExecutionFailure),
+    ):
+        [e async for e in provider.stream_response(req)]
+
+    messages = " | ".join(r.getMessage() for r in caplog.records)
+    assert "authorization: <redacted>" in messages
+    assert "useful traceback detail" in messages
+    assert "NATIVE_TRACE_SECRET" not in messages
 
 
 @pytest.mark.asyncio
@@ -213,7 +262,7 @@ async def test_openai_compat_stream_failure_default_logs_exclude_exception_str(c
     provider = NvidiaNimProvider(
         config, nim_settings=NimSettings(), rate_limiter=passthrough_rate_limiter()
     )
-    req = make_openai_compat_stream_request()
+    req = make_messages_request()
 
     @asynccontextmanager
     async def _noop_slot():
@@ -232,7 +281,7 @@ async def test_openai_compat_stream_failure_default_logs_exclude_exception_str(c
             _noop_slot,
         ),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
@@ -251,7 +300,7 @@ async def test_openai_compat_stream_failure_default_logs_cause_types_only(caplog
     provider = NvidiaNimProvider(
         config, nim_settings=NimSettings(), rate_limiter=passthrough_rate_limiter()
     )
-    req = make_openai_compat_stream_request()
+    req = make_messages_request()
     error = openai.APIConnectionError(
         request=httpx.Request("POST", "http://localhost:1/v1/chat/completions")
     )
@@ -274,7 +323,7 @@ async def test_openai_compat_stream_failure_default_logs_cause_types_only(caplog
             _noop_slot,
         ),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
@@ -294,7 +343,7 @@ async def test_openai_compat_stream_failure_respects_verbose_flag(caplog):
     provider = NvidiaNimProvider(
         config, nim_settings=NimSettings(), rate_limiter=passthrough_rate_limiter()
     )
-    req = make_openai_compat_stream_request()
+    req = make_messages_request()
 
     @asynccontextmanager
     async def _noop_slot():
@@ -305,7 +354,9 @@ async def test_openai_compat_stream_failure_respects_verbose_flag(caplog):
             provider,
             "_create_stream",
             new_callable=AsyncMock,
-            side_effect=RuntimeError("SECRET_OPENAI_COMPAT"),
+            side_effect=RuntimeError(
+                "api_key=SECRET_OPENAI_COMPAT useful traceback detail"
+            ),
         ),
         patch.object(
             provider._rate_limiter,
@@ -313,9 +364,11 @@ async def test_openai_compat_stream_failure_respects_verbose_flag(caplog):
             _noop_slot,
         ),
         caplog.at_level(logging.ERROR),
-        pytest.raises(ProviderError),
+        pytest.raises(ExecutionFailure),
     ):
         [e async for e in provider.stream_response(req)]
 
     messages = " | ".join(r.getMessage() for r in caplog.records)
-    assert "SECRET_OPENAI_COMPAT" in messages
+    assert "api_key=<redacted>" in messages
+    assert "useful traceback detail" in messages
+    assert "SECRET_OPENAI_COMPAT" not in messages

@@ -2,15 +2,19 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from typing import Any
 
+from loguru import logger
 from pydantic import BaseModel
 
+from free_claude_code.application.model_metadata import ProviderModelInfo
 from free_claude_code.config.constants import HTTP_CONNECT_TIMEOUT_DEFAULT
-from free_claude_code.providers.model_listing import (
-    ProviderModelInfo,
-    model_infos_from_ids,
+from free_claude_code.core.anthropic.models import MessagesRequest
+from free_claude_code.core.diagnostics import (
+    exception_cause_types,
+    redacted_exception_traceback,
 )
+from free_claude_code.core.trace import trace_event
+from free_claude_code.providers.model_listing import model_infos_from_ids
 
 
 class ProviderConfig(BaseModel):
@@ -41,10 +45,10 @@ class BaseProvider(ABC):
         self._config = config
 
     def _is_thinking_enabled(
-        self, request: Any, thinking_enabled: bool | None = None
+        self, request: MessagesRequest, thinking_enabled: bool | None = None
     ) -> bool:
         """Return whether thinking should be enabled for this request."""
-        thinking = getattr(request, "thinking", None)
+        thinking = request.thinking
         config_enabled = (
             self._config.enable_thinking
             if thinking_enabled is None
@@ -52,40 +56,17 @@ class BaseProvider(ABC):
         )
         request_enabled = True
         if thinking is not None:
-            thinking_type = (
-                thinking.get("type")
-                if isinstance(thinking, dict)
-                else getattr(thinking, "type", None)
-            )
-            if isinstance(thinking, dict):
-                enabled = thinking.get("enabled")
-                enabled_supplied = "enabled" in thinking
-            else:
-                enabled = getattr(thinking, "enabled", None)
-                fields_set = getattr(thinking, "model_fields_set", None)
-                enabled_supplied = (
-                    "enabled" in fields_set
-                    if isinstance(fields_set, set | frozenset)
-                    else enabled is not None
-                )
-            if enabled_supplied and enabled is not None:
-                request_enabled = bool(enabled)
-            if thinking_type == "disabled":
+            if "enabled" in thinking.model_fields_set and thinking.enabled is not None:
+                request_enabled = thinking.enabled
+            if thinking.type == "disabled":
                 request_enabled = False
         return config_enabled and request_enabled
 
+    @abstractmethod
     def preflight_stream(
-        self, request: Any, *, thinking_enabled: bool | None = None
+        self, request: MessagesRequest, *, thinking_enabled: bool | None = None
     ) -> None:
-        """Eagerly validate/build the upstream request before opening an SSE stream.
-
-        Subclasses with ``_build_request_body`` (OpenAI and native) raise
-        :class:`providers.exceptions.InvalidRequestError` on conversion failures.
-        """
-        build = getattr(self, "_build_request_body", None)
-        if build is None:
-            return
-        build(request, thinking_enabled=thinking_enabled)
+        """Validate the upstream request before opening an SSE stream."""
 
     def _log_stream_transport_error(
         self,
@@ -96,11 +77,6 @@ class BaseProvider(ABC):
         request_id: str | None = None,
     ) -> None:
         """Log streaming transport failures (metadata-only unless verbose is enabled)."""
-        from loguru import logger
-
-        from free_claude_code.core.trace import trace_event
-        from free_claude_code.providers.error_mapping import exception_cause_types
-
         response = getattr(error, "response", None)
         http_status = (
             getattr(response, "status_code", None) if response is not None else None
@@ -118,8 +94,12 @@ class BaseProvider(ABC):
         )
 
         if self._config.log_api_error_tracebacks:
-            logger.opt(exception=error).error(
-                "{}_ERROR:{} {}: {}", tag, req_tag, type(error).__name__, error
+            logger.error(
+                "{}_ERROR:{} exc_type={}\n{}",
+                tag,
+                req_tag,
+                type(error).__name__,
+                redacted_exception_traceback(error),
             )
             return
         logger.error(
@@ -146,7 +126,7 @@ class BaseProvider(ABC):
     @abstractmethod
     async def stream_response(
         self,
-        request: Any,
+        request: MessagesRequest,
         input_tokens: int = 0,
         *,
         request_id: str | None = None,

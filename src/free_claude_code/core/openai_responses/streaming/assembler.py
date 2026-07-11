@@ -6,16 +6,18 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+from free_claude_code.core.failures import ExecutionFailure
 from free_claude_code.core.trace import trace_event
 
 from ..anthropic_sse import AnthropicSseEvent
-from ..errors import ResponsesConversionError
+from ..errors import ResponsesConversionError, openai_error_from_failure
 from ..ids import (
     new_call_id,
     new_message_item_id,
     new_reasoning_item_id,
     new_response_id,
 )
+from ..models import OpenAIResponsesRequest
 from ..tools import responses_tool_identity_from_anthropic_name
 from . import event_builders as events
 from .blocks import ReasoningBlockState, TextBlockState, ToolBlockState
@@ -30,7 +32,7 @@ from .ledger import ResponsesOutputLedger
 class ResponsesStreamAssembler:
     """Assemble Responses SSE events from indexed Anthropic content blocks."""
 
-    def __init__(self, request: Mapping[str, Any]) -> None:
+    def __init__(self, request: OpenAIResponsesRequest) -> None:
         self._request = request
         self._response_id = new_response_id()
         self._created_at = int(time.time())
@@ -40,6 +42,7 @@ class ResponsesStreamAssembler:
             on_invalid_function_call=self._fail_invalid_function_call,
         )
         self._started = False
+        self._provisional_error: dict[str, Any] | None = None
         self.terminal = False
         self.final_response: dict[str, Any] | None = None
 
@@ -77,13 +80,21 @@ class ResponsesStreamAssembler:
             "object": "response",
             "created_at": self._created_at,
             "status": status,
-            "model": str(self._request.get("model", "")),
+            "model": self._request.model,
             "output": self._ledger.output(),
-            "parallel_tool_calls": bool(self._request.get("parallel_tool_calls", True)),
-            "tool_choice": self._request.get("tool_choice", "auto"),
-            "temperature": self._request.get("temperature"),
-            "top_p": self._request.get("top_p"),
-            "max_output_tokens": self._request.get("max_output_tokens"),
+            "parallel_tool_calls": (
+                True
+                if self._request.parallel_tool_calls is None
+                else self._request.parallel_tool_calls
+            ),
+            "tool_choice": (
+                "auto"
+                if self._request.tool_choice is None
+                else self._request.tool_choice
+            ),
+            "temperature": self._request.temperature,
+            "top_p": self._request.top_p,
+            "max_output_tokens": self._request.max_output_tokens,
             "usage": self._ledger.usage(),
             "error": error,
         }
@@ -91,6 +102,9 @@ class ResponsesStreamAssembler:
     def complete_response(self) -> list[str]:
         chunks = self._flush_active_blocks()
         if self.terminal:
+            return chunks
+        if self._provisional_error is not None:
+            chunks.extend(self._finish_failed_response(self._provisional_error))
             return chunks
         self.final_response = self.response_payload(status="completed")
         chunks.append(events.response_completed(self.final_response))
@@ -102,10 +116,22 @@ class ResponsesStreamAssembler:
         if self.terminal:
             return chunks
         error = openai_error_from_anthropic_error(data)
-        self.final_response = self.response_payload(status="failed", error=error)
-        chunks.append(events.response_failed(self.final_response))
-        self.terminal = True
+        chunks.extend(self._finish_failed_response(error))
         return chunks
+
+    def fail_execution(self, failure: ExecutionFailure) -> list[str]:
+        """Finish the current response with a canonical execution failure."""
+        chunks = self._flush_active_blocks()
+        if self.terminal:
+            return chunks
+        chunks.extend(self._finish_failed_response(openai_error_from_failure(failure)))
+        return chunks
+
+    def _finish_failed_response(self, error: dict[str, Any]) -> list[str]:
+        self._provisional_error = None
+        self.final_response = self.response_payload(status="failed", error=error)
+        self.terminal = True
+        return [events.response_failed(self.final_response)]
 
     def _ensure_started(self) -> list[str]:
         if self._started:
@@ -248,7 +274,7 @@ class ResponsesStreamAssembler:
         if self.terminal:
             return chunks
         identity = responses_tool_identity_from_anthropic_name(
-            self._request, _string_value(block.get("name"))
+            self._request.tools, _string_value(block.get("name"))
         )
         state = ToolBlockState(
             index=index,
@@ -312,9 +338,9 @@ class ResponsesStreamAssembler:
             error_type=type(exc).__name__,
         )
         error = replay_unsafe_function_call_error()
-        self.final_response = self.response_payload(status="failed", error=error)
-        self.terminal = True
-        return [events.response_failed(self.final_response)]
+        if self._provisional_error is None:
+            self._provisional_error = error
+        return []
 
 
 def _event_index(data: Mapping[str, Any]) -> int | None:

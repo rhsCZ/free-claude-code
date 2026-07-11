@@ -5,20 +5,23 @@ from typing import Any
 
 import httpx
 
+from free_claude_code.core.anthropic.models import MessagesRequest
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
 from free_claude_code.core.anthropic.streaming import (
-    MIDSTREAM_RECOVERY_ATTEMPTS,
     AnthropicStreamLedger,
-    TruncatedProviderStreamError,
     accept_tool_json_repair,
     continuation_suffix,
-    is_retryable_stream_error,
     make_text_recovery_body,
     make_tool_repair_body,
     parse_complete_tool_input,
     tool_schemas_by_name,
 )
 from free_claude_code.core.trace import trace_event
+from free_claude_code.providers.stream_recovery import (
+    MIDSTREAM_RECOVERY_ATTEMPTS,
+    TruncatedProviderStreamError,
+    is_retryable_stream_error,
+)
 from free_claude_code.providers.transports.http import maybe_await_aclose
 
 IterStreamChunks = Callable[..., AsyncIterator[str]]
@@ -42,6 +45,7 @@ class AnthropicMessagesRecovery:
         *,
         req_tag: str,
         thinking_enabled: bool,
+        request_id: str | None = None,
     ) -> tuple[str, str]:
         """Collect text/thinking from an internal native recovery request."""
         last_error: Exception | None = None
@@ -49,11 +53,12 @@ class AnthropicMessagesRecovery:
             response: httpx.Response | None = None
             try:
                 response = await self._transport._rate_limiter.execute_with_retry(
-                    self._transport._validated_stream_send, body, req_tag=req_tag
+                    self._transport._validated_stream_send,
+                    body,
+                    req_tag=req_tag,
+                    request_id=request_id,
                 )
-                state = self._transport._new_stream_state(
-                    None, thinking_enabled=thinking_enabled
-                )
+                state = self._transport._new_stream_state()
                 chunks = [
                     chunk
                     async for chunk in self._iter_stream_chunks(
@@ -115,7 +120,7 @@ class AnthropicMessagesRecovery:
         self,
         *,
         body: dict[str, Any],
-        request: Any,
+        request: MessagesRequest,
         ledger: AnthropicStreamLedger,
         error: Exception,
         request_id: str | None,
@@ -150,6 +155,7 @@ class AnthropicMessagesRecovery:
                         recovery_body,
                         req_tag=req_tag,
                         thinking_enabled=thinking_enabled,
+                        request_id=request_id,
                     )
                     repair = accept_tool_json_repair(
                         block.content,
@@ -198,6 +204,7 @@ class AnthropicMessagesRecovery:
             recovery_body,
             req_tag=req_tag,
             thinking_enabled=thinking_enabled,
+            request_id=request_id,
         )
         text_suffix = continuation_suffix(partial_text, text)
         thinking_suffix = continuation_suffix(partial_thinking, thinking)
