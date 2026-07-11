@@ -77,6 +77,56 @@ The installable wheel packages are declared in [pyproject.toml](pyproject.toml):
 [smoke/](smoke/) contains local and live product smoke tests that can launch
 subprocesses or touch real services.
 
+Production package imports follow one least-privilege dependency policy. Every
+listed edge is exercised by the current code; removing the last use of an edge
+also removes that permission:
+
+| Package | Exact allowed direct dependencies |
+| --- | --- |
+| `config` | none |
+| `core` | none |
+| `application` | `config`, `core` |
+| `messaging` | `config`, `core` |
+| `providers` | `application`, `config`, `core` |
+| `api` | `application`, `config`, `core` |
+| `cli` | `config`, `core` |
+| `runtime` | `api`, `application`, `cli`, `config`, `core`, `messaging`, `providers` |
+
+There is one exact exception:
+`free_claude_code.cli.entrypoints` imports
+`free_claude_code.runtime.bootstrap` because the installed server executable
+delegates construction to the process composition root. The exception does not
+permit any broader dependency from `cli` to `runtime`. Every new top-level
+package or cross-package edge must be added to the policy deliberately.
+
+Internal modules do not import an ancestor package facade; package initializers
+may import dependency leaves to publish supported exports. Code outside
+`core.openai_responses` and `messaging.trees` consumes those owners through their
+package facades. The supported top-level messaging extension surface is
+`IncomingMessage`, `MessageScope`, `ManagedClaudeSessionProtocol`,
+`ManagedClaudeSessionManagerProtocol`, and `OutboundMessenger`; workflow,
+persistence, parsing, and mutable tree implementations remain internal.
+
+Optional voice dependencies also have exact lazy owners:
+
+| Dependency | Owner |
+| --- | --- |
+| `torch`, `transformers`, `librosa` | `messaging.transcription` |
+| `riva.client` | `providers.nvidia_nim.voice` |
+
+They must be imported below a function boundary so importing the application or
+server does not require an optional extra. Static AST enforcement cannot observe
+dynamic imports. Deliberate provider factory loading is instead protected by the
+provider catalog, supported-ID, and factory synchronization contract.
+
+[core/version.py](src/free_claude_code/core/version.py) is the sole runtime owner
+of the FCC release version. It reads installed distribution metadata for
+FastAPI/OpenAPI, FCC-owned CLI `--version` output, and the outbound web-tools
+user agent. A source-only checkout without installed metadata reports the
+explicit `0+unknown` fallback; runtime code never parses `pyproject.toml` or
+duplicates a release literal. Claude and Codex launcher arguments remain
+transparent to their wrapped clients.
+
 The main ownership rule is that Anthropic and Responses protocol schemas and
 shared protocol behavior belong in [src/free_claude_code/core/](src/free_claude_code/core/), while request routing and
 provider execution belong in [src/free_claude_code/application/](src/free_claude_code/application/). Routes use core schemas
@@ -84,9 +134,10 @@ directly for wire validation and call application use cases. Provider modules us
 the same concrete request types and neutral helpers instead of importing the API
 adapter or another provider.
 Protocol consumers use the public `core.anthropic` and
-`core.openai_responses` facades. Low-level core and provider modules may import
-the dependency-leaf `models.py` modules directly so their type dependency is
-explicit; package initialization and those leaves must remain import-order safe.
+`core.openai_responses` facades. Low-level Anthropic core and provider modules
+may import the dependency-leaf Anthropic `models.py` module directly so their
+type dependency is explicit; Responses consumers outside its owner remain
+facade-only. Package initialization and those leaves must remain import-order safe.
 The model-list schema stays beside its API-owned construction policy in
 `api/model_catalog.py`; there is no generic API model package.
 
@@ -423,7 +474,12 @@ owns provider-ID-to-constructor selection; concrete provider classes own their
 transport inheritance or composition. Each lazy provider receives a fresh
 `ProviderRateLimiter`; there is no process singleton or second limiter registry.
 The provider cache already guarantees one provider and limiter per provider ID
-within a generation. Retired generations
+within a generation. Provider admission combines a strict proactive window with
+one reactive backoff deadline. Positive backoffs can only extend that deadline,
+and admission loops until proactive capacity and the final reactive check are
+simultaneously available. The proactive timestamp is recorded only when that
+check succeeds, so a concurrent 429/5xx cannot be missed, shortened, consume
+unused quota, or release queued requests as an expiry burst. Retired generations
 retain their own synchronization state until request leases drain, while new
 generations and separate server instances never reuse it. Hot replacement
 therefore begins with fresh quota state; an old and new generation enforce
@@ -785,12 +841,19 @@ message ID lists; platform IO decides whether to use native batch deletion
 (Telegram) or internal per-message deletion (Discord).
 Shared voice-note orchestration lives in
 [messaging/platforms/voice_flow.py](src/free_claude_code/messaging/platforms/voice_flow.py), which owns
-pending voice registration, file-size validation, temp-file cleanup,
-transcription, cancellation, error replies, and the handoff to
-`IncomingMessage`. It depends only on the consumer-owned `Transcriber` protocol
-from [messaging/voice.py](src/free_claude_code/messaging/voice.py). Pending voice lookups use the
-same `(platform, chat_id)` `MessageScope` as tree references, so raw IDs from
-different transports cannot share cancellation ownership. Bootstrap selects either the
+file-size validation, temp-file cleanup, transcription, error replies, and the
+handoff to `IncomingMessage`. Before status delivery it reserves an opaque claim
+in the `PendingVoiceRegistry` owned by [messaging/voice.py](src/free_claude_code/messaging/voice.py).
+That registry atomically owns optional status binding, cancellation by either
+message ID, and the exclusive handoff claim; only a flow that wins the handoff
+transition may invoke the message workflow. Cancellation can therefore win while
+status delivery is still pending, and a stale flow cannot bind or remove a newer
+generation reusing the same ID. Once cancellation wins, late status or
+transcription completion is cleanup-only and cannot hand off work or emit a
+second error reply. Pending voice identities use the same
+`(platform, chat_id)` `MessageScope` as tree references, so raw IDs from different
+transports cannot share cancellation ownership. The flow depends only on the
+consumer-owned `Transcriber` protocol. Bootstrap selects either the
 instance-owned local Whisper `TranscriptionService` or the provider-owned
 `NvidiaNimTranscriber`. Messaging no longer imports a provider adapter, and the
 local service retains only one lazy pipeline for its immutable runtime settings;
@@ -981,6 +1044,11 @@ Important safety boundaries:
 Deterministic tests live under [tests/](tests/). They cover API routes, config,
 provider conversion, provider transports, streaming contracts, messaging, CLI
 adapters, import boundaries, provider catalog contracts, and other invariants.
+The import-boundary contract derives every static production edge with one AST
+scanner and checks the package matrix, exact exceptions, facade ownership, and
+lazy optional imports. The resulting first-party module graph must remain
+acyclic. These tests protect current architectural properties rather than
+preserving deleted modules or an exact internal file layout.
 
 Live and local product tests live under [smoke/](smoke/). See
 [smoke/README.md](smoke/README.md) for target taxonomy, environment variables,
