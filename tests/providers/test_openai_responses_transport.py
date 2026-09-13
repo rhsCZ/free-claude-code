@@ -170,9 +170,11 @@ def _sse(*events: Mapping[str, object]) -> str:
 
 def _client(
     handler: Callable[[httpx2.Request], httpx2.Response],
+    *,
+    api_key: str = "test-key",
 ) -> AsyncOpenAI:
     return AsyncOpenAI(
-        api_key="test-key",
+        api_key=api_key,
         base_url="https://provider.invalid/v1",
         max_retries=0,
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
@@ -1139,14 +1141,20 @@ async def test_cancellation_closes_the_sdk_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preflight_rejects_fields_responses_cannot_represent() -> None:
+async def test_startup_rejects_fields_responses_cannot_represent() -> None:
     client = _client(lambda _request: httpx2.Response(500))
     transport = _transport(client)
     request = _request(stop_sequences=["done"])
 
     try:
         with pytest.raises(InvalidRequestError, match="stop_sequences"):
-            transport.preflight_messages(request, reasoning=REASONING_ON)
+            transport.stream_messages(
+                request,
+                input_tokens=0,
+                request_id=None,
+                response_model=request.model,
+                reasoning=REASONING_ON,
+            )
     finally:
         await client.close()
 
