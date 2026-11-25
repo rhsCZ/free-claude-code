@@ -12,7 +12,10 @@ from free_claude_code.core.delivered_response import (
     is_structured_text_format,
 )
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
-from free_claude_code.core.history_replay import protected_reasoning
+from free_claude_code.core.history_replay import (
+    plain_messages_thinking,
+    protected_reasoning,
+)
 from free_claude_code.core.json_types import (
     JsonObject,
     JsonValue,
@@ -160,9 +163,7 @@ class SourceRecoveryState:
                 "redacted_thinking",
             ):
                 self._pending_reasoning.add(index)
-                if (
-                    block.get("signature") or block.get("data")
-                ) and self.unsafe_reason is None:
+                if not plain_messages_thinking(block) and self.unsafe_reason is None:
                     self.unsafe_reason = "signed_thinking"
             if isinstance(block, dict) and block.get("type") not in (
                 "text",

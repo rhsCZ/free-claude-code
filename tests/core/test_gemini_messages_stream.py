@@ -1,0 +1,69 @@
+"""Native Messages reasoning reaches Gemini clients as readable text or replay."""
+
+import pytest
+
+from free_claude_code.core.gemini.messages_stream import GeminiMessagesStream
+from free_claude_code.core.history_replay import (
+    ReplayOrigin,
+    ReplayRecord,
+    encode_replay,
+)
+from free_claude_code.core.json_types import JsonObject
+from free_claude_code.core.openai_tool_names import OpenAIToolNameCodec
+
+_ORIGIN = ReplayOrigin("provider", "messages", "endpoint", "key", "model")
+_CARRIER = encode_replay(
+    ReplayRecord(
+        ReplayOrigin("provider", "chat", "endpoint", "key", "m"),
+        {"reasoning_content": "Portable thought"},
+    )
+)
+
+
+@pytest.mark.parametrize(
+    ("block", "replayed"),
+    [
+        ({"type": "thinking", "thinking": "Find 17."}, False),
+        (
+            {"type": "thinking", "thinking": "Find 17.", "extra_content": {"a": 1}},
+            True,
+        ),
+        ({"type": "thinking", "thinking": "Find 17.", "signature": "sig"}, True),
+        ({"type": "redacted_thinking", "data": _CARRIER}, True),
+    ],
+    ids=["unsigned", "unsigned-native-fields", "signed", "redacted-readable-carrier"],
+)
+def test_completed_reasoning_replays_only_native_state(
+    block: JsonObject, replayed: bool
+) -> None:
+    stream = GeminiMessagesStream(
+        response_id="response",
+        model="public",
+        include_thoughts=True,
+        origin=_ORIGIN,
+        tool_names=OpenAIToolNameCodec.from_names([]),
+        declared_names=frozenset(),
+        reserved_tool_ids=frozenset(),
+    )
+    events: list[JsonObject] = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg", "role": "assistant", "content": []},
+        },
+        {"type": "content_block_start", "index": 0, "content_block": block},
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "text", "text": "17"},
+        },
+        {"type": "content_block_stop", "index": 1},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+        {"type": "message_stop"},
+    ]
+    output = "".join(
+        frame for event in events for frame in stream.feed(str(event["type"]), event)
+    )
+
+    assert '"text": "17"' in output
+    assert ("thoughtSignature" in output) == replayed

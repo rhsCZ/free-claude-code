@@ -11,6 +11,7 @@ from free_claude_code.core.anthropic.native import (
 )
 from free_claude_code.core.anthropic.stream_contracts import parse_sse_lines
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
+from free_claude_code.core.history_replay import ReplayOrigin, decode_replay
 from free_claude_code.core.json_types import JsonObject, JsonValue
 from free_claude_code.core.openai_responses import (
     AnthropicToResponsesStream,
@@ -18,6 +19,8 @@ from free_claude_code.core.openai_responses import (
     build_responses_messages_request,
 )
 from tests.wire_payload import array_payload, object_array, object_payload
+
+_ORIGIN = ReplayOrigin("provider", "messages", "endpoint", "key", "model")
 
 
 def _stream(*, tools: list[JsonObject] | None = None) -> AnthropicToResponsesStream:
@@ -29,6 +32,7 @@ def _stream(*, tools: list[JsonObject] | None = None) -> AnthropicToResponsesStr
         request,
         public_model="public",
         tool_identities=prepared.tool_identities,
+        origin=_ORIGIN,
     )
 
 
@@ -146,7 +150,12 @@ def test_text_thinking_and_redacted_blocks_keep_order_replay_and_exact_usage() -
     first = output[0]
     assert isinstance(first, Mapping)
     assert first["content"] == [{"type": "reasoning_text", "text": "think"}]
-    assert first["encrypted_content"] == "sig-end"
+    assert decode_replay(cast(str, first["encrypted_content"])).native == {
+        "type": "thinking",
+        "thinking": "think",
+        "extension": {"x": 1},
+        "signature": "sig-end",
+    }
     assert cast(Mapping[str, JsonValue], output[1])["encrypted_content"] == "opaque"
     assert cast(Mapping[str, JsonValue], output[2])["content"] == [
         {"type": "output_text", "text": "Hello world", "annotations": []}
@@ -420,3 +429,30 @@ def test_terminal_usage_omits_missing_cache_and_provisional_thinking_details() -
         "output_tokens": 19,
         "total_tokens": 22,
     }
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "thinking", "thinking": "Plan"},
+        {"type": "thinking", "thinking": "Plan", "extra_content": {"a": 1}},
+    ],
+    ids=["unsigned", "unsigned-native-fields"],
+)
+def test_unsigned_reasoning_replays_only_native_state(block: JsonObject) -> None:
+    stream = _stream()
+    _start(stream)
+    _feed(stream, "content_block_start", index=0, content_block=block)
+    done = _feed(stream, "content_block_stop", index=0)
+
+    item = next(
+        object_payload(event["item"])
+        for event in done
+        if event.get("type") == "response.output_item.done"
+    )
+    carrier = item.get("encrypted_content")
+    if set(block) == {"type", "thinking"}:
+        assert carrier is None
+    else:
+        assert isinstance(carrier, str)
+        assert decode_replay(carrier).native == block

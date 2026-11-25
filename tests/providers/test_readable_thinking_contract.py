@@ -52,7 +52,9 @@ def unsigned_events(protocol: str):
             ],
         }
     elif protocol == "messages":
-        object_payload(events[1]["content_block"]).pop("signature")
+        block = object_payload(events[1]["content_block"])
+        block.pop("signature")
+        block.pop("extension")
     else:
         for event in events:
             items = [object_payload(event["item"])] if "item" in event else []
@@ -220,8 +222,15 @@ def test_open_messages_thinking_blocks_recovery_before_its_signature_is_known() 
             {"type": "signature_delta", "signature": "signed"},
         ),
         _messages_reasoning({"type": "redacted_thinking", "data": "opaque"}),
+        _messages_reasoning(
+            {
+                "type": "thinking",
+                "thinking": "Plan",
+                "extra_content": {"google": {"thought_signature": "native"}},
+            }
+        ),
     ],
-    ids=["signed", "redacted"],
+    ids=["signed", "redacted", "unsigned-native-fields"],
 )
 def test_completed_protected_messages_reasoning_stays_unsafe(
     events: list[JsonObject],

@@ -142,3 +142,21 @@ def test_empty_signature_fragment_leaves_thinking_readable() -> None:
     ):
         delivered.observe(event)
     assert delivered.snapshot().eligible
+
+
+def test_unsigned_thinking_with_native_fields_is_not_continuable() -> None:
+    delivered = DeliveredResponse("messages")
+    for event in (
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "thinking",
+                "thinking": "Readable.",
+                "extra_content": {"google": {"thought_signature": "native"}},
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+    ):
+        delivered.observe(event)
+    assert not delivered.snapshot().eligible

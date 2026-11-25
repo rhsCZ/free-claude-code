@@ -257,8 +257,8 @@ def _validate_record(payload: JsonObject, *, associated: bool = False) -> Replay
             (
                 kind == "thinking"
                 and isinstance(native.get("thinking"), str)
-                and isinstance(native.get("signature"), str)
-                and native["signature"]
+                and isinstance(native.get("signature", ""), str)
+                and not plain_messages_thinking(native)
             )
             or (
                 kind == "redacted_thinking"
@@ -267,7 +267,7 @@ def _validate_record(payload: JsonObject, *, associated: bool = False) -> Replay
             )
         ):
             raise HistoryReplayError(
-                "Messages replay requires signed thinking or redacted data."
+                "Messages replay requires native thinking state or redacted data."
             )
     if protocol == "chat":
         fields = {"reasoning_details": list, "reasoning_content": str, "reasoning": str}
@@ -591,6 +591,16 @@ def responses_reasoning_blocks(item: Mapping[str, JsonValue]) -> list[JsonValue]
 
 
 type HistoryPath = tuple[str | int, ...]
+
+
+def plain_messages_thinking(block: Mapping[str, DecimalJsonValue]) -> bool:
+    """Messages thinking is plain only when it carries readable text and no state."""
+    return (
+        block.get("type") == "thinking"
+        and isinstance(block.get("thinking"), str)
+        and not block.get("signature")
+        and set(block) <= {"type", "thinking", "signature"}
+    )
 
 
 def protected_reasoning(item: Mapping[str, DecimalJsonValue]) -> bool:

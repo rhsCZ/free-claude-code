@@ -412,6 +412,7 @@ class AnthropicMessagesTransport:
                 request,
                 public_model=response_model or request.model,
                 tool_identities=prepared.tool_identities,
+                origin=origin,
             ),
             continuation=continuation,
         )

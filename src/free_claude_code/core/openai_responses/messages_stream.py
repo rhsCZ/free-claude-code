@@ -11,6 +11,11 @@ from free_claude_code.core.anthropic.native_stream import (
     NativeMessagesStreamState,
 )
 from free_claude_code.core.failures import ExecutionFailure
+from free_claude_code.core.history_replay import (
+    ReplayOrigin,
+    ReplayRecord,
+    encode_replay,
+)
 from free_claude_code.core.json_types import JsonObject, JsonValue, load_json_value
 
 from .errors import openai_error_from_failure
@@ -109,8 +114,10 @@ class AnthropicToResponsesStream:
         *,
         public_model: str,
         tool_identities: Mapping[str, ResponsesToolIdentity],
+        origin: ReplayOrigin,
     ) -> None:
         self._request = request
+        self._origin = origin
         self._public_model = public_model
         self._identities = tool_identities
         self._response_id = new_response_id()
@@ -341,7 +348,12 @@ class AnthropicToResponsesStream:
         if isinstance(state, ReasoningBlockState):
             field = "signature" if completed.body.get("type") == "thinking" else "data"
             value = completed.body.get(field)
-            if isinstance(value, str) and value:
+            if set(completed.body) - {"type", "thinking", field}:
+                # Only a block without other native fields is replayable by its carrier.
+                state.encrypted_content = encode_replay(
+                    ReplayRecord(self._origin, completed.body)
+                )
+            elif isinstance(value, str) and value:
                 state.encrypted_content = value
             if completed.body.get("type") == "thinking" and not state.text_parts:
                 state.text_parts.append("")

@@ -75,7 +75,7 @@ def test_missing_signature_is_not_accepted_as_signed_history() -> None:
         "fcc:anthropic-reasoning:v1:"
         + base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
     )
-    with pytest.raises(HistoryReplayError, match="signed"):
+    with pytest.raises(HistoryReplayError, match="Messages replay requires"):
         decode_replay(carrier)
 
 

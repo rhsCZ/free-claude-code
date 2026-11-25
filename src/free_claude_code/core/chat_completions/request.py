@@ -281,28 +281,28 @@ def _messages_content(value: JsonValue) -> list[JsonValue]:
 
 def _reasoning_items(message: JsonObject) -> list[JsonObject]:
     details = json_objects(message.get("reasoning_details") or [])
-    readable: list[tuple[JsonValue, str, bool]] = [
+    # Readable parts and replay carriers keep the order in which they were echoed.
+    entries: list[tuple[JsonValue, str, bool] | JsonObject] = [
         (None, text, False)
         for key in ("reasoning_content", "reasoning")
         if isinstance(text := message.get(key), str) and text
     ]
-    carriers: list[JsonObject] = []
     for detail in details:
         kind = detail.get("type")
         if kind == "reasoning.encrypted":
-            carriers.append(detail)
+            entries.append(detail)
         elif kind in ("reasoning.text", "reasoning.summary"):
             if detail.get("signature"):
                 raise ChatConversionError(
                     "Signed reasoning details require native Chat egress"
                 )
-            readable.extend(
+            entries.extend(
                 (detail.get("id"), text, summary)
                 for text, summary in readable_reasoning({"reasoning_details": [detail]})
             )
         else:
             raise ChatConversionError("Unsupported reasoning detail")
-    for detail in carriers:
+    for detail in [entry for entry in entries if isinstance(entry, dict)]:
         data = detail.get("data")
         if not is_replay(data):
             continue
@@ -313,29 +313,41 @@ def _reasoning_items(message: JsonObject) -> list[JsonObject]:
             # record. Edited echoes must not silently replay the original text.
             for summary in (False, True):
                 echoed = "".join(
-                    text
-                    for owner, text, kind in readable
-                    if owner == source and kind == summary
+                    entry[1]
+                    for entry in entries
+                    if isinstance(entry, tuple)
+                    and entry[0] == source
+                    and entry[2] == summary
                 )
                 original = "".join(text for text, kind in native if kind == summary)
                 if echoed and echoed != original:
                     raise ChatConversionError(
                         "Readable reasoning changed its protected replay record"
                     )
-            readable = [part for part in readable if part[0] != source]
+            entries = [
+                entry
+                for entry in entries
+                if isinstance(entry, dict) or entry[0] != source
+            ]
         else:
             # Older Chat writers emit one scalar echo with an unlabelled carrier.
             represented = {
                 ("".join(text for text, kind in native if kind == summary), summary)
                 for summary in (False, True)
             }
-            readable = [
-                (owner, text, summary)
-                for owner, text, summary in readable
-                if owner is not None or (text, summary) not in represented
+            entries = [
+                entry
+                for entry in entries
+                if isinstance(entry, dict)
+                or entry[0] is not None
+                or (entry[1], entry[2]) not in represented
             ]
     items: list[JsonObject] = []
-    for _, text, summary in readable:
+    for entry in entries:
+        if isinstance(entry, dict):
+            items.append({"type": "reasoning", "encrypted_content": entry["data"]})
+            continue
+        _, text, summary = entry
         items.append(
             {
                 "type": "reasoning",
@@ -347,10 +359,6 @@ def _reasoning_items(message: JsonObject) -> list[JsonObject]:
                 ),
             }
         )
-    items.extend(
-        {"type": "reasoning", "encrypted_content": detail["data"]}
-        for detail in carriers
-    )
     return items
 
 

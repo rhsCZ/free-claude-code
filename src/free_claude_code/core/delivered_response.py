@@ -10,6 +10,7 @@ import simplejson
 from .chat_completions.response import ChatResponseAccumulator
 from .gemini.response import gemini_parts
 from .history_replay import (
+    plain_messages_thinking,
     protected_reasoning,
     readable_reasoning,
     unprotected_replay,
@@ -319,13 +320,20 @@ class DeliveredResponse:
                 "tool_use",
             }:
                 self.unsafe_reason = "native_content"
-            if block.get("signature") or block.get("type") == "redacted_thinking":
-                value = (
-                    block.get("data")
-                    if block.get("type") == "redacted_thinking"
-                    else block.get("signature")
+            if block.get("type") in {
+                "thinking",
+                "redacted_thinking",
+            } and not plain_messages_thinking(block):
+                field = (
+                    "data" if block.get("type") == "redacted_thinking" else "signature"
                 )
-                if unprotected_replay(value) is None:
+                # Only a readable FCC carrier, with no other native fields, is
+                # state that a different attempt can continue from.
+                if unprotected_replay(block.get(field)) is None or set(block) - {
+                    "type",
+                    "thinking",
+                    field,
+                }:
                     self.unsafe_reason = "opaque_reasoning"
         elif kind == "content_block_delta":
             delta = json_object(data.get("delta", {}))
