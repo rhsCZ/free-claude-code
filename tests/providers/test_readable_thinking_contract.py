@@ -235,6 +235,21 @@ def test_completed_protected_messages_reasoning_stays_unsafe(
     assert snapshot.can_handoff
 
 
+def test_messages_signature_is_protected_when_it_arrives() -> None:
+    source = SourceRecoveryState(Mock())
+    source.observe(
+        "messages",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "signed"},
+        },
+    )
+
+    snapshot = source.snapshot(body={}, protocol="messages", normal_stop_seen=False)
+    assert snapshot.unsafe_reason == "signed_thinking"
+
+
 def test_gemini_signature_cannot_clear_unsupported_native_evidence() -> None:
     source = SourceRecoveryState(Mock())
     source.observe(

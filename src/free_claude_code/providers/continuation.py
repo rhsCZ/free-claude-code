@@ -50,7 +50,6 @@ class SourceRecoveryState:
         )
         self.unsafe_reason: str | None = None
         self._pending_reasoning: set[int | str] = set()
-        self._signed: set[int | str] = set()
         self._handoff_blocked = False
 
     @property
@@ -161,8 +160,10 @@ class SourceRecoveryState:
                 "redacted_thinking",
             ):
                 self._pending_reasoning.add(index)
-                if block.get("signature") or block.get("data"):
-                    self._signed.add(index)
+                if (
+                    block.get("signature") or block.get("data")
+                ) and self.unsafe_reason is None:
+                    self.unsafe_reason = "signed_thinking"
             if isinstance(block, dict) and block.get("type") not in (
                 "text",
                 "tool_use",
@@ -177,13 +178,15 @@ class SourceRecoveryState:
             ) == "citations_delta":
                 self.unsafe_reason = "native_content"
                 self._handoff_blocked = True
-            if delta.get("type") == "signature_delta" and delta.get("signature"):
-                self._signed.add(index)
-            if kind == "content_block_stop" and index in self._pending_reasoning:
-                self._pending_reasoning.discard(index)
+            if (
+                delta.get("type") == "signature_delta"
+                and delta.get("signature")
+                and self.unsafe_reason is None
+            ):
+                self.unsafe_reason = "signed_thinking"
+            if kind == "content_block_stop":
                 # Completed unsigned thinking is readable output, like Chat reasoning.
-                if index in self._signed and self.unsafe_reason is None:
-                    self.unsafe_reason = "signed_thinking"
+                self._pending_reasoning.discard(index)
         elif protocol == "responses":
             item = payload.get("item")
             if isinstance(item, dict):
