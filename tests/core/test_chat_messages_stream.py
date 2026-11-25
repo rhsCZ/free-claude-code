@@ -63,11 +63,22 @@ _SIGNATURE: JsonObject = {
                     ),
                 }
             ],
-            "",
-            1,
+            "Find 17.",
+            0,
+        ),
+        (
+            [{"type": "thinking", "thinking": "Find 17.", "extension": {"a": 1}}],
+            "Find 17.",
+            0,
         ),
     ],
-    ids=["unsigned", "unsigned-extra", "signed", "redacted-readable-carrier"],
+    ids=[
+        "unsigned",
+        "unsigned-extra",
+        "signed",
+        "redacted-readable-carrier",
+        "unsigned-unknown-field",
+    ],
 )
 def test_completed_reasoning_replays_only_messages_replay_state(
     reasoning: list[JsonObject], streamed: str, replays: int
@@ -110,26 +121,40 @@ def test_completed_reasoning_replays_only_messages_replay_state(
     assert choices[-1]["finish_reason"] == "stop"
 
 
-def test_echoed_reasoning_keeps_upstream_block_order() -> None:
+_FIRST: JsonObject = {
+    "type": "content_block_start",
+    "index": 0,
+    "content_block": {"type": "thinking", "thinking": "First."},
+}
+_SECOND: list[JsonObject] = [
+    {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {"type": "thinking", "thinking": "Second."},
+    },
+    {"type": "content_block_stop", "index": 1},
+]
+_FIRST_STOP: JsonObject = {"type": "content_block_stop", "index": 0}
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        [_FIRST, _SIGNATURE, _FIRST_STOP, *_SECOND],
+        [_FIRST, *_SECOND, _SIGNATURE, _FIRST_STOP],
+    ],
+    ids=["sequential", "overlapping"],
+)
+def test_echoed_reasoning_keeps_upstream_block_order(
+    reasoning: list[JsonObject],
+) -> None:
     chunks = _chunks(
         [
             {
                 "type": "message_start",
                 "message": {"id": "msg", "role": "assistant", "content": []},
             },
-            {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "thinking", "thinking": "First."},
-            },
-            _SIGNATURE,
-            {"type": "content_block_stop", "index": 0},
-            {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {"type": "thinking", "thinking": "Second."},
-            },
-            {"type": "content_block_stop", "index": 1},
+            *reasoning,
             {
                 "type": "content_block_start",
                 "index": 2,

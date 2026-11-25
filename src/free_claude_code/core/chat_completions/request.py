@@ -324,11 +324,20 @@ def _reasoning_items(message: JsonObject) -> list[JsonObject]:
                     raise ChatConversionError(
                         "Readable reasoning changed its protected replay record"
                     )
-            entries = [
-                entry
-                for entry in entries
-                if isinstance(entry, dict) or entry[0] != source
+            owned = [
+                position
+                for position, entry in enumerate(entries)
+                if isinstance(entry, tuple) and entry[0] == source
             ]
+            if owned:
+                # The record takes the place of its first readable echo, which
+                # comes before any block that started after it.
+                entries = [
+                    detail if position == owned[0] else entry
+                    for position, entry in enumerate(entries)
+                    if position == owned[0]
+                    or (position not in owned and entry is not detail)
+                ]
         else:
             # Older Chat writers emit one scalar echo with an unlabelled carrier.
             represented = {

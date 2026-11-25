@@ -160,3 +160,17 @@ def test_unsigned_thinking_with_native_fields_is_not_continuable() -> None:
     ):
         delivered.observe(event)
     assert not delivered.snapshot().eligible
+
+
+def test_signed_text_is_not_continuable() -> None:
+    delivered = DeliveredResponse("messages")
+    for event in (
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": "hello", "signature": "opaque"},
+        },
+        {"type": "content_block_stop", "index": 0},
+    ):
+        delivered.observe(event)
+    assert not delivered.snapshot().eligible

@@ -6,7 +6,12 @@ from typing import cast
 from uuid import uuid4
 
 from ..anthropic.native_stream import NativeMessagesStreamState
-from ..history_replay import ReplayOrigin, ReplayRecord, plain_messages_thinking
+from ..history_replay import (
+    ReplayOrigin,
+    ReplayRecord,
+    readable_reasoning,
+    unprotected_replay,
+)
 from ..json_types import JsonObject, JsonValue
 from ..openai_tool_names import OpenAIToolNameCodec
 from .response import GeminiOutput, conversion_failure, function_arguments
@@ -66,6 +71,15 @@ class GeminiMessagesStream:
                     {"text": content["thinking"], "thought": True},
                     source=cast(int, payload["index"]),
                 )
+            if (
+                kind == "redacted_thinking"
+                and (record := unprotected_replay(content.get("data"))) is not None
+                and (text := "".join(t for t, _ in readable_reasoning(record.native)))
+            ):
+                # A readable local carrier has no native state, only its text.
+                return self._output.part(
+                    {"text": text, "thought": True}, source=cast(int, payload["index"])
+                )
         elif event_type == "content_block_delta":
             delta = payload.get("delta")
             assert isinstance(delta, Mapping)
@@ -83,13 +97,10 @@ class GeminiMessagesStream:
         if block is not None:
             if block.body.get("type") in {"thinking", "redacted_thinking"}:
                 self._has_reasoning = True
-                source = cast(int, payload["index"])
-                if plain_messages_thinking(block.body):
-                    self._output.discard(source)
-                else:
-                    self._output.keep(
-                        ReplayRecord(self._origin, deepcopy(block.body)), source=source
-                    )
+                self._output.capture(
+                    ReplayRecord(self._origin, deepcopy(block.body)),
+                    source=cast(int, payload["index"]),
+                )
             elif block.body.get("type") == "tool_use":
                 name = self._names.decode(str(block.body["name"]))
                 if name not in self._declared:

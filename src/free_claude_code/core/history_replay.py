@@ -258,7 +258,7 @@ def _validate_record(payload: JsonObject, *, associated: bool = False) -> Replay
                 kind == "thinking"
                 and isinstance(native.get("thinking"), str)
                 and isinstance(native.get("signature", ""), str)
-                and not plain_messages_thinking(native)
+                and (bool(native.get("signature")) or protected_reasoning(native))
             )
             or (
                 kind == "redacted_thinking"
@@ -267,7 +267,7 @@ def _validate_record(payload: JsonObject, *, associated: bool = False) -> Replay
             )
         ):
             raise HistoryReplayError(
-                "Messages replay requires native thinking state or redacted data."
+                "Messages replay requires protected thinking or redacted data."
             )
     if protocol == "chat":
         fields = {"reasoning_details": list, "reasoning_content": str, "reasoning": str}
@@ -593,16 +593,6 @@ def responses_reasoning_blocks(item: Mapping[str, JsonValue]) -> list[JsonValue]
 type HistoryPath = tuple[str | int, ...]
 
 
-def plain_messages_thinking(block: Mapping[str, DecimalJsonValue]) -> bool:
-    """Messages thinking is plain only when it carries readable text and no state."""
-    return (
-        block.get("type") == "thinking"
-        and isinstance(block.get("thinking"), str)
-        and not block.get("signature")
-        and set(block) <= {"type", "thinking", "signature"}
-    )
-
-
 def protected_reasoning(item: Mapping[str, DecimalJsonValue]) -> bool:
     """Local carriers do not turn unsigned readable data into protected state."""
     record = _record(item, "encrypted_content", "signature", "data")
@@ -628,6 +618,14 @@ def protected_reasoning(item: Mapping[str, DecimalJsonValue]) -> bool:
     return isinstance(details, list) and any(
         isinstance(detail, dict) and protected_reasoning(detail) for detail in details
     )
+
+
+def protected_upstream_reasoning(item: Mapping[str, DecimalJsonValue]) -> bool:
+    """Upstream output whose local carrier cannot be read is opaque native state."""
+    try:
+        return protected_reasoning(item)
+    except HistoryReplayError:
+        return True
 
 
 def normalize_history_source(

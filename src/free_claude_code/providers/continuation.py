@@ -13,8 +13,8 @@ from free_claude_code.core.delivered_response import (
 )
 from free_claude_code.core.failures import ExecutionFailure, FailureKind
 from free_claude_code.core.history_replay import (
-    plain_messages_thinking,
     protected_reasoning,
+    protected_upstream_reasoning,
 )
 from free_claude_code.core.json_types import (
     JsonObject,
@@ -163,7 +163,7 @@ class SourceRecoveryState:
                 "redacted_thinking",
             ):
                 self._pending_reasoning.add(index)
-                if not plain_messages_thinking(block) and self.unsafe_reason is None:
+                if protected_upstream_reasoning(block) and self.unsafe_reason is None:
                     self.unsafe_reason = "signed_thinking"
             if isinstance(block, dict) and block.get("type") not in (
                 "text",
@@ -185,6 +185,18 @@ class SourceRecoveryState:
                 and self.unsafe_reason is None
             ):
                 self.unsafe_reason = "signed_thinking"
+            # A signature fragment is judged above; other delta fields are complete.
+            if (
+                protected_upstream_reasoning(
+                    {key: value for key, value in delta.items() if key != "signature"}
+                )
+                and self.unsafe_reason is None
+            ):
+                self.unsafe_reason = (
+                    "signed_thinking"
+                    if delta.get("type") == "thinking_delta"
+                    else "native_content"
+                )
             if kind == "content_block_stop":
                 # Completed unsigned thinking is readable output, like Chat reasoning.
                 self._pending_reasoning.discard(index)

@@ -15,6 +15,7 @@ from free_claude_code.core.history_replay import (
     ReplayOrigin,
     ReplayRecord,
     encode_replay,
+    protected_upstream_reasoning,
 )
 from free_claude_code.core.json_types import JsonObject, JsonValue, load_json_value
 
@@ -348,8 +349,10 @@ class AnthropicToResponsesStream:
         if isinstance(state, ReasoningBlockState):
             field = "signature" if completed.body.get("type") == "thinking" else "data"
             value = completed.body.get(field)
-            if set(completed.body) - {"type", "thinking", field}:
-                # Only a block without other native fields is replayable by its carrier.
+            if protected_upstream_reasoning(
+                {key: item for key, item in completed.body.items() if key != field}
+            ):
+                # The raw carrier cannot hold state from the block's other fields.
                 state.encrypted_content = encode_replay(
                     ReplayRecord(self._origin, completed.body)
                 )

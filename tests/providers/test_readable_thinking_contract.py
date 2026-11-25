@@ -52,9 +52,7 @@ def unsigned_events(protocol: str):
             ],
         }
     elif protocol == "messages":
-        block = object_payload(events[1]["content_block"])
-        block.pop("signature")
-        block.pop("extension")
+        object_payload(events[1]["content_block"]).pop("signature")
     else:
         for event in events:
             items = [object_payload(event["item"])] if "item" in event else []
@@ -508,3 +506,15 @@ async def test_gemini_protected_owners_survive_reused_indices_and_client_echo(
     assert assistant.get("reasoning_content", "") == (
         "" if echo == "cli" else "Unsigned.Ordinary.Tail."
     )
+
+
+def test_native_fields_on_a_thinking_delta_are_protected() -> None:
+    source = SourceRecoveryState(Mock())
+    for payload in _messages_reasoning(
+        {"type": "thinking", "thinking": ""},
+        {"type": "thinking_delta", "thinking": "Plan", "extra_content": {"a": 1}},
+    ):
+        source.observe("messages", payload)
+
+    snapshot = source.snapshot(body={}, protocol="messages", normal_stop_seen=False)
+    assert snapshot.unsafe_reason == "signed_thinking"

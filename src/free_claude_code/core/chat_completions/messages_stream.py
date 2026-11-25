@@ -8,7 +8,9 @@ from ..history_replay import (
     ReplayOrigin,
     ReplayRecord,
     encode_replay,
-    plain_messages_thinking,
+    protected_upstream_reasoning,
+    readable_reasoning,
+    unprotected_replay,
 )
 from ..json_types import JsonObject, JsonValue, json_object, json_text
 from .response import ChatOutput, chat_failure
@@ -78,6 +80,14 @@ class ChatMessagesStream:
                 return self._output.thought(
                     json_text(content["thinking"]), source=f"rs_{data['index']}"
                 )
+            if (
+                kind == "redacted_thinking"
+                and self._include_thoughts
+                and (record := unprotected_replay(content.get("data"))) is not None
+                and (text := "".join(t for t, _ in readable_reasoning(record.native)))
+            ):
+                # A readable local carrier has no native state, only its text.
+                return self._output.thought(text, source=f"rs_{data['index']}")
         elif event_type == "content_block_delta":
             delta = json_object(data["delta"])
             if delta["type"] == "text_delta":
@@ -90,8 +100,8 @@ class ChatMessagesStream:
                 raise chat_failure("Chat cannot represent native Messages citations")
         if block is not None:
             if block.body["type"] in {"thinking", "redacted_thinking"}:
-                # Plain thinking was already streamed and has no state to replay.
-                if plain_messages_thinking(block.body):
+                # Readable reasoning was already streamed and has no state to replay.
+                if not protected_upstream_reasoning(block.body):
                     return []
                 return self._output.replay(
                     encode_replay(ReplayRecord(self._origin, block.body)),

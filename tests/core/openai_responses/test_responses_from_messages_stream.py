@@ -150,12 +150,7 @@ def test_text_thinking_and_redacted_blocks_keep_order_replay_and_exact_usage() -
     first = output[0]
     assert isinstance(first, Mapping)
     assert first["content"] == [{"type": "reasoning_text", "text": "think"}]
-    assert decode_replay(cast(str, first["encrypted_content"])).native == {
-        "type": "thinking",
-        "thinking": "think",
-        "extension": {"x": 1},
-        "signature": "sig-end",
-    }
+    assert first["encrypted_content"] == "sig-end"
     assert cast(Mapping[str, JsonValue], output[1])["encrypted_content"] == "opaque"
     assert cast(Mapping[str, JsonValue], output[2])["content"] == [
         {"type": "output_text", "text": "Hello world", "annotations": []}
@@ -436,8 +431,9 @@ def test_terminal_usage_omits_missing_cache_and_provisional_thinking_details() -
     [
         {"type": "thinking", "thinking": "Plan"},
         {"type": "thinking", "thinking": "Plan", "extra_content": {"a": 1}},
+        {"type": "thinking", "thinking": "Plan", "extension": {"a": 1}},
     ],
-    ids=["unsigned", "unsigned-native-fields"],
+    ids=["unsigned", "unsigned-native-fields", "unsigned-unknown-field"],
 )
 def test_unsigned_reasoning_replays_only_native_state(block: JsonObject) -> None:
     stream = _stream()
@@ -451,7 +447,7 @@ def test_unsigned_reasoning_replays_only_native_state(block: JsonObject) -> None
         if event.get("type") == "response.output_item.done"
     )
     carrier = item.get("encrypted_content")
-    if set(block) == {"type", "thinking"}:
+    if "extra_content" not in block:
         assert carrier is None
     else:
         assert isinstance(carrier, str)

@@ -92,16 +92,12 @@ class GeminiOutput:
             )
 
     def capture(self, record: ReplayRecord, *, source: int | None = None) -> None:
+        if source is not None and not readable_reasoning(record.native):
+            self.discard(source)
         if not protected_reasoning(record.native):
             if source is not None:
                 self.discard(source)
             return
-        self.keep(record, source=source)
-
-    def keep(self, record: ReplayRecord, *, source: int | None = None) -> None:
-        """Store one record that its source protocol classified as native state."""
-        if source is not None and not readable_reasoning(record.native):
-            self.discard(source)
         size = len(encode_replay(record).encode("utf-8"))
         index = self._record_sources.get(source) if source is not None else None
         if index is None:
