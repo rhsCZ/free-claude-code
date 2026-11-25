@@ -16,6 +16,7 @@ from free_claude_code.core.gemini.replay import decode_bundle
 from free_claude_code.core.history_replay import (
     responses_reasoning_blocks,
 )
+from free_claude_code.core.json_types import JsonObject
 from free_claude_code.core.reasoning import ReasoningPolicy
 from free_claude_code.core.stream_output import StreamOutput
 from free_claude_code.providers.anthropic_messages.transport import (
@@ -172,6 +173,66 @@ def test_gemini_continuation_accepts_signature_but_keeps_failure_protected() -> 
         == "signed_thinking"
     )
     assert not source.can_handoff
+
+
+def _messages_reasoning(block: JsonObject, *deltas: JsonObject) -> list[JsonObject]:
+    return [
+        {"type": "content_block_start", "index": 0, "content_block": block},
+        *({"type": "content_block_delta", "index": 0, "delta": d} for d in deltas),
+        {"type": "content_block_stop", "index": 0},
+    ]
+
+
+def test_completed_unsigned_messages_thinking_stays_recoverable() -> None:
+    source = SourceRecoveryState(Mock())
+    for payload in _messages_reasoning(
+        {"type": "thinking", "thinking": ""},
+        {"type": "thinking_delta", "thinking": "Plan"},
+    ):
+        source.observe("messages", payload)
+
+    snapshot = source.snapshot(body={}, protocol="messages", normal_stop_seen=False)
+    assert snapshot.unsafe_reason is None
+    assert snapshot.can_handoff
+
+
+def test_open_messages_thinking_blocks_recovery_before_its_signature_is_known() -> None:
+    start, delta, _stop = _messages_reasoning(
+        {"type": "thinking", "thinking": ""},
+        {"type": "thinking_delta", "thinking": "Plan"},
+    )
+    source = SourceRecoveryState(Mock())
+    source.observe("messages", start)
+    source.observe("messages", delta)
+
+    snapshot = source.snapshot(body={}, protocol="messages", normal_stop_seen=False)
+    assert snapshot.unsafe_reason is not None
+    assert not snapshot.can_handoff
+    with pytest.raises(ExecutionFailure, match="native state"):
+        SourceRecoveryState(Mock()).observe("messages", start, continuing=True)
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        _messages_reasoning(
+            {"type": "thinking", "thinking": "Plan"},
+            {"type": "signature_delta", "signature": "signed"},
+        ),
+        _messages_reasoning({"type": "redacted_thinking", "data": "opaque"}),
+    ],
+    ids=["signed", "redacted"],
+)
+def test_completed_protected_messages_reasoning_stays_unsafe(
+    events: list[JsonObject],
+) -> None:
+    source = SourceRecoveryState(Mock())
+    for payload in events:
+        source.observe("messages", payload)
+
+    snapshot = source.snapshot(body={}, protocol="messages", normal_stop_seen=False)
+    assert snapshot.unsafe_reason == "signed_thinking"
+    assert snapshot.can_handoff
 
 
 def test_gemini_signature_cannot_clear_unsupported_native_evidence() -> None:

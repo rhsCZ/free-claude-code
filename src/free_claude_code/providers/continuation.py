@@ -44,7 +44,7 @@ class SourceRecoveryState:
     ) -> None:
         self._execution = execution
         self._prior_unsafe_reason = (
-            previous.unsafe_reason or previous._prior_unsafe_reason
+            previous._unsafe() or previous._prior_unsafe_reason
             if previous is not None
             else None
         )
@@ -57,6 +57,12 @@ class SourceRecoveryState:
     def can_handoff(self) -> bool:
         return not self._handoff_blocked and not self._pending_reasoning
 
+    def _unsafe(self) -> str | None:
+        # Open native reasoning may still receive a signature, so it is protected.
+        return self.unsafe_reason or (
+            "open_reasoning" if self._pending_reasoning else None
+        )
+
     def snapshot(
         self,
         *,
@@ -68,7 +74,7 @@ class SourceRecoveryState:
         return SourceRecoverySnapshot(
             normal_stop_seen=normal_stop_seen,
             structured_output=_structured_output(body, protocol),
-            unsafe_reason=self.unsafe_reason
+            unsafe_reason=self._unsafe()
             or (self._prior_unsafe_reason if for_model_fallback else None),
             can_handoff=self.can_handoff,
         )
@@ -154,7 +160,6 @@ class SourceRecoveryState:
                 "thinking",
                 "redacted_thinking",
             ):
-                self.unsafe_reason = "signed_thinking"
                 self._pending_reasoning.add(index)
                 if block.get("signature") or block.get("data"):
                     self._signed.add(index)
@@ -172,12 +177,13 @@ class SourceRecoveryState:
             ) == "citations_delta":
                 self.unsafe_reason = "native_content"
                 self._handoff_blocked = True
-            if delta.get("type") in ("thinking_delta", "signature_delta"):
-                self.unsafe_reason = "signed_thinking"
-                if delta.get("signature"):
-                    self._signed.add(index)
-            if kind == "content_block_stop" and index in self._signed:
+            if delta.get("type") == "signature_delta" and delta.get("signature"):
+                self._signed.add(index)
+            if kind == "content_block_stop" and index in self._pending_reasoning:
                 self._pending_reasoning.discard(index)
+                # Completed unsigned thinking is readable output, like Chat reasoning.
+                if index in self._signed and self.unsafe_reason is None:
+                    self.unsafe_reason = "signed_thinking"
         elif protocol == "responses":
             item = payload.get("item")
             if isinstance(item, dict):
@@ -211,10 +217,11 @@ class SourceRecoveryState:
             if kind == "response.output_text.annotation.added":
                 self.unsafe_reason = "native_content"
                 self._handoff_blocked = True
+        unsafe = self._unsafe()
         if (
             continuing
-            and self.unsafe_reason
-            and not (protocol == "gemini" and self.unsafe_reason == "signed_thinking")
+            and unsafe
+            and not (protocol == "gemini" and unsafe == "signed_thinking")
         ):
             raise ExecutionFailure(
                 kind=FailureKind.UPSTREAM,

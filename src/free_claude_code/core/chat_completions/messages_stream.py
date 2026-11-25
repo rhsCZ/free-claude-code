@@ -4,7 +4,12 @@ from collections.abc import Mapping
 from uuid import uuid4
 
 from ..anthropic.native_stream import NativeMessagesStreamState
-from ..history_replay import ReplayOrigin, ReplayRecord, encode_replay
+from ..history_replay import (
+    ReplayOrigin,
+    ReplayRecord,
+    encode_replay,
+    protected_reasoning,
+)
 from ..json_types import JsonObject, JsonValue, json_object, json_text
 from .response import ChatOutput, chat_failure
 
@@ -85,6 +90,9 @@ class ChatMessagesStream:
                 raise chat_failure("Chat cannot represent native Messages citations")
         if block is not None:
             if block.body["type"] in {"thinking", "redacted_thinking"}:
+                # Readable thinking was already streamed and has no state to replay.
+                if not protected_reasoning(block.body):
+                    return []
                 return self._output.replay(
                     encode_replay(ReplayRecord(self._origin, block.body)),
                     source=f"rs_{data['index']}",
